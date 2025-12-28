@@ -143,13 +143,50 @@ if run:
     else:
         with st.spinner("分析中..."):
             try:
-                result_text = keiba_bot.run_all_races(
+                if run:
+    if not target_races:
+        st.warning("レースを選んでください")
+    else:
+        # 逐次表示エリア
+        live = st.container()
+        result_blocks = []
+
+        with st.spinner("分析中...（終わったレースから順に表示します）"):
+            try:
+                for race_num, block in keiba_bot.run_races_iter(
                     year=str(year),
                     month=str(month),
                     day=str(day),
                     place_code=str(place_code),
-                    target_races=target_races
-                )
+                    target_races=target_races,
+                    ui=False
+                ):
+                    block = _normalize_text(block)
+                    result_blocks.append(block)
+
+                    # ここでレースごとに表示（終わった順）
+                    with live:
+                        with st.expander(f"{place_name} {race_num}R", expanded=(race_num == min(target_races))):
+                            st.text_area(
+                                f"{place_name} {race_num}R",
+                                block,
+                                height=260
+                            )
+
+                # コピー用に最後に結合して保存
+                result_text = _normalize_text("\n\n".join(result_blocks))
+                st.session_state["result_text"] = result_text
+                st.session_state["last_meta"] = {
+                    "year": year, "month": month, "day": day,
+                    "place_name": place_name,
+                    "races": sorted(list(target_races))
+                }
+
+                st.success(f"{place_name}：{', '.join(f'{r}R' for r in sorted(target_races))} の分析が完了しました！")
+
+            except Exception as e:
+                st.error(f"エラーが発生しました: {e}")
+
                 result_text = _normalize_text(result_text)
                 st.session_state["result_text"] = result_text
                 st.success(
