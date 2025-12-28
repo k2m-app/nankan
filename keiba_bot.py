@@ -23,6 +23,37 @@ SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
 
 # ==================================================
+# 内部ユーティリティ：UI出力のON/OFFを切り替える
+# ==================================================
+def _ui_info(ui: bool, msg: str):
+    if ui:
+        st.info(msg)
+
+def _ui_success(ui: bool, msg: str):
+    if ui:
+        st.success(msg)
+
+def _ui_warning(ui: bool, msg: str):
+    if ui:
+        st.warning(msg)
+
+def _ui_error(ui: bool, msg: str):
+    if ui:
+        st.error(msg)
+
+def _ui_caption(ui: bool, msg: str):
+    if ui:
+        st.caption(msg)
+
+def _ui_markdown(ui: bool, msg: str):
+    if ui:
+        st.markdown(msg)
+
+def _ui_divider(ui: bool):
+    if ui:
+        st.divider()
+
+# ==================================================
 # Supabase
 # ==================================================
 @st.cache_resource
@@ -75,14 +106,14 @@ def login_keibabook(driver: webdriver.Chrome, wait: WebDriverWait):
 # ==================================================
 # スクレイピング：日程→レースID一覧（競馬ブック）
 # ==================================================
-def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code):
+def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code, ui: bool = False):
     """
     日程ページから「指定競馬場コード」のレースID(16桁)を拾う（競馬ブック）
     """
     date_str = f"{year}{month}{day}"
     url = f"https://s.keibabook.co.jp/chihou/nittei/{date_str}10"
 
-    st.info(f"📅 日程ページからレースIDを取得中... ({url})")
+    _ui_info(ui, f"📅 日程ページからレースIDを取得中... ({url})")
     driver.get(url)
 
     try:
@@ -109,9 +140,9 @@ def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code):
 
     race_ids.sort()
     if not race_ids:
-        st.warning(f"⚠️ 指定した競馬場コード({target_place_code})のレースIDが見つかりませんでした。")
+        _ui_warning(ui, f"⚠️ 指定した競馬場コード({target_place_code})のレースIDが見つかりませんでした。")
     else:
-        st.success(f"✅ {len(race_ids)} 件のレースIDを取得しました。")
+        _ui_success(ui, f"✅ {len(race_ids)} 件のレースIDを取得しました。")
     return race_ids
 
 # ==================================================
@@ -187,7 +218,7 @@ def parse_cyokyo(html: str):
     return cyokyo_dict
 
 # ==================================================
-# 地方競馬公式（keiba.go.jp）：DOMで出馬表を正確にパース（ここが大改修）
+# 地方競馬公式（keiba.go.jp）：DOMで出馬表を正確にパース
 # ==================================================
 _KEIBAGO_UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -205,14 +236,6 @@ def _norm_name(s: str) -> str:
 def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int, baba_code: str):
     """
     keiba.go.jp DebaTableSmall を「表の列」で堅牢に読む版
-
-    返り値:
-      header: str
-      horses: { "馬番": {horse, jockey, trainer, prev_jockey, is_change, waku, umaban} }
-      url: str
-
-    前走騎手:
-      「前走」列のテキスト内にある  "◯人　(騎手名) 55.0" から抽出
     """
     date_str = f"{year}/{str(month).zfill(2)}/{str(day).zfill(2)}"
     url = (
@@ -225,24 +248,17 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
     r.encoding = r.apparent_encoding or "utf-8"
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # --- ヘッダー（上の開催情報） ---
     header = ""
-    # 先頭の「2025年12月26日（金） 大井 第1競走 ...」が入る table.bs の1行目を拾う
     top_bs = soup.select_one("table.bs")
     if top_bs:
         header = top_bs.get_text(" ", strip=True)
 
-    # --- 出馬表の「枠/馬番/馬名/調教師/騎手/前走...」が載る本体表 ---
-    # class="dbtbl" の中に table(border=1) があり、その中の tr が馬ごとの行
     main_table = soup.select_one("td.dbtbl table.bs")
     if not main_table:
-        # HTMLが少し違う場合の保険
         main_table = soup.select_one("table.bs[border='1']")
 
     horses = {}
 
-    # 前走欄から「前走騎手」を拾う
-    # 例: "2/6　5人　桑村真 55.0" → 桑村真
     prev_jockey_re = re.compile(r"\d+人\s+([☆▲△◇]?\S+)\s+\d{1,2}\.\d")
 
     if main_table:
@@ -251,43 +267,34 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
             if len(tds) < 6:
                 continue
 
-            # 先頭2列が「枠」「馬番」になっている “馬の行” だけ処理する
             waku = tds[0].get_text(strip=True)
             umaban = tds[1].get_text(strip=True)
 
             if not (waku.isdigit() and umaban.isdigit()):
                 continue
 
-            # 馬名（font.bamei > b の中）
             horse = ""
             bamei_tag = tds[2].select_one("font.bamei b")
             if bamei_tag:
                 horse = bamei_tag.get_text(strip=True)
             else:
-                # 保険：td内テキストから推定（馬名が<b>になってないケース）
                 horse = tds[2].get_text(" ", strip=True)
 
-            # 調教師：td[3] 例: "月岡健（大井）" → 月岡健
             trainer_raw = tds[3].get_text(" ", strip=True)
             trainer = trainer_raw.split("（")[0].strip()
 
-            # 騎手：td[4] は "55.0<br>桑村真<br>（大井）..." のように改行区切り
             jockey_lines = [x.strip() for x in tds[4].get_text("\n", strip=True).split("\n") if x.strip()]
             jockey = "不明"
-            # だいたい [斤量, 騎手名, (所属), 成績] の順なので2番目が騎手名になりやすい
             if len(jockey_lines) >= 2:
                 jockey = jockey_lines[1]
 
-            # 前走騎手：前走列（通常は td[8]）から抽出
             prev_jockey = ""
-            # 列構成が固定（枠/馬番/馬名/調教師/騎手/馬体重/変更/着別/前走/前々走/3走前/4走前）
             if len(tds) >= 9:
                 zenso_txt = tds[8].get_text(" ", strip=True)
                 m = prev_jockey_re.search(zenso_txt)
                 if m:
                     prev_jockey = m.group(1).strip()
 
-            # 乗り替わり判定（前走騎手が取れていて、現在騎手と違う）
             cj = _norm_name(jockey)
             pj = _norm_name(prev_jockey)
             is_change = bool(pj and cj and pj != cj)
@@ -360,33 +367,44 @@ def stream_dify_workflow(full_text: str):
         yield f"⚠️ API Error: {str(e)}"
 
 # ==================================================
-# メイン：全レース実行
+# メイン：全レース実行（★ここが重要：文字列を return）
 # ==================================================
-def run_all_races(year: str, month: str, day: str, place_code: str, target_races: set[int] | None):
+def run_all_races(
+    year: str,
+    month: str,
+    day: str,
+    place_code: str,
+    target_races: set[int] | None,
+    ui: bool = False,
+) -> str:
     """
     place_code：競馬ブック側（10大井/11川崎/12船橋/13浦和）
     騎手・調教師は keiba.go.jp の babaCode を使う
+
+    ui=False（デフォルト）: 画面描画せず、結果文字列だけ返す（app.py向け）
+    ui=True              : 従来通り st.* で進捗を出す（単体実行向け）
     """
     place_names = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
     place_name = place_names.get(place_code, "地方")
 
-    # keiba.go.jp 側の babaCode
     baba_map = {"10": "20", "11": "21", "12": "19", "13": "18"}
     baba_code = baba_map.get(place_code)
     if not baba_code:
-        st.error("babaCode mapping が未定義です。place_code を確認してください。")
-        return
+        _ui_error(ui, "babaCode mapping が未定義です。place_code を確認してください。")
+        return "⚠️ babaCode mapping が未定義です。place_code を確認してください。"
+
+    result_blocks: list[str] = []
 
     driver = build_driver()
     wait = WebDriverWait(driver, 12)
 
     try:
-        st.info("🔑 ログイン中...（競馬ブック）")
+        _ui_info(ui, "🔑 ログイン中...（競馬ブック）")
         login_keibabook(driver, wait)
 
-        race_ids = fetch_race_ids_from_schedule(driver, year, month, day, place_code)
+        race_ids = fetch_race_ids_from_schedule(driver, year, month, day, place_code, ui=ui)
         if not race_ids:
-            return
+            return "⚠️ レースIDが取得できませんでした。日付/競馬場コードを確認してください。"
 
         for i, race_id in enumerate(race_ids):
             race_num = i + 1
@@ -395,15 +413,10 @@ def run_all_races(year: str, month: str, day: str, place_code: str, target_races
 
             race_num_str = f"{race_num:02}"
 
-            st.markdown(f"## {place_name} {race_num}R")
-            st.caption(f"race_id(keibabook): {race_id}")
-
-            status_area = st.empty()
-            result_area = st.empty()
+            _ui_markdown(ui, f"## {place_name} {race_num}R")
+            _ui_caption(ui, f"race_id(keibabook): {race_id}")
 
             try:
-                status_area.info("📡 データ収集中...")
-
                 # --------------------------
                 # 0) keiba.go.jp 出馬表（騎手・調教師・前走騎手）
                 # --------------------------
@@ -414,16 +427,17 @@ def run_all_races(year: str, month: str, day: str, place_code: str, target_races
                     race_no=race_num,
                     baba_code=str(baba_code),
                 )
-                st.caption(f"keiba.go.jp: {keibago_url}")
+                _ui_caption(ui, f"keiba.go.jp: {keibago_url}")
                 if header:
-                    st.caption(f"keiba.go.jp header: {header}")
+                    _ui_caption(ui, f"keiba.go.jp header: {header}")
 
                 if not keibago_dict:
-                    st.warning("⚠️ keiba.go.jp から出馬表が取れませんでした（続行しますが騎手/調教師が不明になります）")
+                    _ui_warning(ui, "⚠️ keiba.go.jp から出馬表が取れませんでした（続行しますが騎手/調教師が不明になります）")
 
                 # --------------------------
                 # 1) 談話（競馬ブック）
                 # --------------------------
+                _ui_info(ui, "📡 データ収集中...（談話）")
                 driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{race_id}")
                 try:
                     wait.until(EC.presence_of_element_located((By.CLASS_NAME, "danwa")))
@@ -437,6 +451,7 @@ def run_all_races(year: str, month: str, day: str, place_code: str, target_races
                 # --------------------------
                 # 2) 調教（競馬ブック）
                 # --------------------------
+                _ui_info(ui, "📡 データ収集中...（調教）")
                 driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{race_id}")
                 try:
                     wait.until(EC.presence_of_element_located((By.CLASS_NAME, "cyokyo")))
@@ -476,8 +491,10 @@ def run_all_races(year: str, month: str, day: str, place_code: str, target_races
                     )
 
                 if not merged_text:
-                    status_area.warning("データなしのためスキップ")
-                    st.divider()
+                    block = f"【{place_name} {race_num}R】\n⚠️ データなしのためスキップ"
+                    result_blocks.append(block)
+                    _ui_warning(ui, "データなしのためスキップ")
+                    _ui_divider(ui)
                     continue
 
                 prompt = (
@@ -487,21 +504,50 @@ def run_all_races(year: str, month: str, day: str, place_code: str, target_races
                     + "\n".join(merged_text)
                 )
 
-                status_area.info("🤖 AI分析中...")
+                # --------------------------
+                # 3) Dify で分析
+                # --------------------------
+                _ui_info(ui, "🤖 AI分析中...")
                 full_ans = ""
-                for chunk in stream_dify_workflow(prompt):
-                    full_ans += chunk
-                    result_area.markdown(full_ans + "▌")
 
-                result_area.markdown(full_ans)
-                status_area.success("✅ 完了")
+                if ui:
+                    # uiモードだけ進捗表示（▌）
+                    result_area = st.empty()
+                    for chunk in stream_dify_workflow(prompt):
+                        full_ans += chunk
+                        result_area.markdown(full_ans + "▌")
+                    result_area.markdown(full_ans)
+                else:
+                    # 静かに全部集める
+                    for chunk in stream_dify_workflow(prompt):
+                        full_ans += chunk
 
+                full_ans = (full_ans or "").strip()
+
+                if full_ans == "":
+                    full_ans = "⚠️ AIの出力が空でした（Dify応答なし/エラーの可能性）"
+
+                _ui_success(ui, "✅ 完了")
+
+                # 保存
                 save_history(year, place_code, place_name, month, day, race_num_str, race_id, full_ans)
 
-            except Exception as e:
-                status_area.error(f"Error: {e}")
+                # 返却用ブロックを追加（★ここがポイント）
+                block = f"【{place_name} {race_num}R】\n{full_ans}"
+                result_blocks.append(block)
 
-            st.divider()
+            except Exception as e:
+                msg = f"【{place_name} {race_num}R】\n⚠️ Error: {e}"
+                result_blocks.append(msg)
+                _ui_error(ui, f"Error: {e}")
+
+            _ui_divider(ui)
 
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except:
+            pass
+
+    # ★必ず文字列を返す（None禁止）
+    return "\n\n".join(result_blocks).strip()
