@@ -35,6 +35,7 @@ def get_supabase_client() -> Client | None:
         print("Supabase client error:", e)
         return None
 
+
 def save_history(year, place_code, place_name, month, day, race_num_str, race_id, ai_answer):
     supabase = get_supabase_client()
     if not supabase:
@@ -46,7 +47,7 @@ def save_history(year, place_code, place_name, month, day, race_num_str, race_id
         "month": str(month).zfill(2),
         "day": str(day).zfill(2),
         "race_num": str(race_num_str),
-        "race_id": str(race_id),
+        "race_id": str(race_id),  # 競馬ブックのrace_idを保存
         "output_text": ai_answer,
     }
     try:
@@ -54,8 +55,9 @@ def save_history(year, place_code, place_name, month, day, race_num_str, race_id
     except Exception as e:
         print("Supabase insert error:", e)
 
+
 # ==================================================
-# スクレイピング：日程→レースID一覧
+# 競馬ブック：日程→レースID一覧
 # ==================================================
 def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code):
     """
@@ -84,7 +86,6 @@ def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code):
         rid = m.group(1)
 
         # IDの7-8桁目（0-index 6:8）が「競馬場コード」になっている前提
-        # 例: 2025191003011226 → rid[6:8] == "10"（大井）みたいな形
         if rid[6:8] == target_place_code:
             if rid not in seen:
                 race_ids.append(rid)
@@ -99,73 +100,9 @@ def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code):
 
     return race_ids
 
-# ==================================================
-# 出馬表：騎手名 + 乗り替わり（強化版）
-# ==================================================
-def parse_syutuba_jockey(html: str) -> dict:
-    """
-    出馬表（table.syutuba_sp）から
-    { "馬番": {"name": "騎手名", "is_change": bool} } を返す
-
-    乗り替わり判定: p.kisyu 内に strong があれば True
-    騎手名: 基本は p.kisyu a のテキスト。無い場合は p.kisyu のテキストから推定。
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    jockey_info = {}
-
-    table = soup.select_one("table.syutuba_sp")
-    if not table:
-        return {}
-
-    rows = table.select("tbody tr") or table.select("tr")
-
-    for row in rows:
-        # 馬番は waku1〜waku8 の td を優先して取る（列ズレに強い）
-        umaban_td = row.find("td", class_=re.compile(r"^waku[1-8]$"))
-        if umaban_td:
-            umaban = umaban_td.get_text(strip=True)
-        else:
-            # フォールバック：先頭tdが数字なら馬番扱い
-            tds = row.find_all("td")
-            if not tds:
-                continue
-            cand = tds[0].get_text(strip=True)
-            if not cand.isdigit():
-                continue
-            umaban = cand
-
-        if not umaban.isdigit():
-            continue
-
-        kisyu_p = row.select_one("p.kisyu")
-        if not kisyu_p:
-            continue
-
-        is_change = kisyu_p.select_one("strong") is not None
-
-        a = kisyu_p.find("a")
-        if a:
-            name = a.get_text(strip=True)
-        else:
-            txt = kisyu_p.get_text(" ", strip=True)
-            parts = [p for p in txt.split() if p]
-            drop = {"牡", "牝", "セン", "☆", "▲", "△", "◇"}
-            cand_parts = []
-            for p in parts:
-                if p in drop:
-                    continue
-                if any(ch.isdigit() for ch in p):
-                    continue
-                cand_parts.append(p)
-            name = cand_parts[0] if cand_parts else ""
-
-        if name:
-            jockey_info[umaban] = {"name": name, "is_change": is_change}
-
-    return jockey_info
 
 # ==================================================
-# その他パース
+# 競馬ブック：レース情報 / 談話 / 調教
 # ==================================================
 def parse_race_info(html: str):
     soup = BeautifulSoup(html, "html.parser")
@@ -187,6 +124,7 @@ def parse_race_info(html: str):
 
     return {"race_name": race_name, "cond": cond}
 
+
 def parse_danwa_comments(html: str):
     soup = BeautifulSoup(html, "html.parser")
     danwa_dict = {}
@@ -206,6 +144,7 @@ def parse_danwa_comments(html: str):
                 current_uma = None
 
     return danwa_dict
+
 
 def parse_cyokyo(html: str):
     soup = BeautifulSoup(html, "html.parser")
@@ -235,6 +174,85 @@ def parse_cyokyo(html: str):
         cyokyo_dict[umaban] = f"【馬名】{bamei} 【短評】{tanpyo} 【詳細】{detail}"
 
     return cyokyo_dict
+
+
+# ==================================================
+# netkeiba（NAR）：騎手＋調教師＋「替」
+# ==================================================
+def build_netkeiba_nar_race_id(year: str, month: str, day: str, keibabook_place_code: str, race_num: int) -> str:
+    """
+    netkeiba NAR race_id = YYYY + 場コード(42/43/44/45) + MMDD + RR(2桁)
+
+    keibabook_place_code:
+      10:大井 11:川崎 12:船橋 13:浦和
+    netkeiba NAR:
+      44:大井 45:川崎 43:船橋 42:浦和
+    """
+    place_map = {"10": "44", "11": "45", "12": "43", "13": "42"}
+    nar_place = place_map.get(str(keibabook_place_code), "")
+    if not nar_place:
+        raise ValueError(f"Unsupported place_code for netkeiba mapping: {keibabook_place_code}")
+
+    mmdd = f"{int(month):02}{int(day):02}"
+    rr = f"{int(race_num):02}"
+    return f"{year}{nar_place}{mmdd}{rr}"
+
+
+def fetch_netkeiba_jockey_trainer(nar_race_id: str) -> dict:
+    """
+    nar.netkeiba.com の競馬新聞から
+    {馬番: {"jockey": str, "trainer": str, "is_change": bool}} を返す
+    """
+    url = f"https://nar.netkeiba.com/race/newspaper.html?race_id={nar_race_id}"
+
+    r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    r.encoding = r.apparent_encoding or "utf-8"
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # テーブル候補（netkeibaは変更があり得るので複数で保険）
+    table = (
+        soup.select_one("table.RaceTable01") or
+        soup.select_one("table#race_table_01") or
+        soup.select_one("table.race_table_01") or
+        soup.select_one("table")  # 最終保険
+    )
+    if not table:
+        return {}
+
+    out = {}
+    rows = table.select("tbody tr")
+    for row in rows:
+        # 馬番：行内で 1-18 の数字だけを探す（最初に見つかったもの）
+        umaban = ""
+        for td in row.find_all("td"):
+            t = td.get_text(strip=True)
+            if t.isdigit() and 1 <= int(t) <= 18:
+                umaban = t
+                break
+        if not umaban:
+            continue
+
+        # 騎手 / 調教師：classがある場合は優先
+        jockey_td = row.select_one("td.Jockey") or row.select_one("td.jockey") or row.select_one("td:nth-of-type(7)")
+        trainer_td = row.select_one("td.Trainer") or row.select_one("td.trainer") or row.select_one("td:nth-of-type(8)")
+
+        jockey_raw = jockey_td.get_text(" ", strip=True) if jockey_td else ""
+        trainer_raw = trainer_td.get_text(" ", strip=True) if trainer_td else ""
+
+        # 「替」判定
+        is_change = "替" in jockey_raw
+        jockey = jockey_raw.replace("替", "").strip()
+
+        # 余計な記号除去（念のため）
+        jockey = re.sub(r"[☆▲△◇\s]", "", jockey).strip()
+        trainer = re.sub(r"\s+", " ", trainer_raw).strip()
+
+        if jockey or trainer:
+            out[umaban] = {"jockey": jockey or "不明", "trainer": trainer or "不明", "is_change": is_change}
+
+    return out
+
 
 # ==================================================
 # Dify（streaming）
@@ -279,11 +297,9 @@ def stream_dify_workflow(full_text: str):
             except:
                 continue
 
-            # streaming中の途中テキスト
             if "answer" in data and isinstance(data["answer"], str):
                 yield data["answer"]
 
-            # workflow終了時のoutputs
             if data.get("event") == "workflow_finished":
                 out = data.get("data", {}).get("outputs", {})
                 texts = [v for v in out.values() if isinstance(v, str)]
@@ -292,6 +308,7 @@ def stream_dify_workflow(full_text: str):
 
     except Exception as e:
         yield f"⚠️ API Error: {str(e)}"
+
 
 # ==================================================
 # Selenium Driver
@@ -304,12 +321,14 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--window-size=1400,2200")
     return webdriver.Chrome(options=options)
 
+
 def login_keibabook(driver: webdriver.Chrome, wait: WebDriverWait):
     driver.get("https://s.keibabook.co.jp/login/login")
     wait.until(EC.visibility_of_element_located((By.NAME, "login_id"))).send_keys(KEIBA_ID)
     driver.find_element(By.CSS_SELECTOR, "input[type='password']").send_keys(KEIBA_PASS)
     driver.find_element(By.CSS_SELECTOR, "input[type='submit']").click()
     time.sleep(1)
+
 
 # ==================================================
 # メイン：全レース実行
@@ -338,7 +357,7 @@ def run_all_races(year: str, month: str, day: str, place_code: str, target_races
             race_num_str = f"{race_num:02}"
 
             st.markdown(f"## {place_name} {race_num}R")
-            st.caption(f"race_id: {race_id}")
+            st.caption(f"keibabook race_id: {race_id}")
 
             status_area = st.empty()
             result_area = st.empty()
@@ -347,7 +366,21 @@ def run_all_races(year: str, month: str, day: str, place_code: str, target_races
                 status_area.info("📡 データ収集中...")
 
                 # --------------------------
-                # 1) 談話
+                # 0) netkeiba（騎手・調教師）
+                # --------------------------
+                nar_race_id = build_netkeiba_nar_race_id(year, month, day, place_code, race_num)
+                st.caption(f"netkeiba nar_race_id: {nar_race_id}")
+
+                netkeiba_dict = {}
+                try:
+                    netkeiba_dict = fetch_netkeiba_jockey_trainer(nar_race_id)
+                    if not netkeiba_dict:
+                        st.warning("⚠️ netkeibaから騎手/調教師が取得できませんでした（続行）。")
+                except Exception as e:
+                    st.warning(f"⚠️ netkeiba取得エラー: {e}（続行）")
+
+                # --------------------------
+                # 1) 談話（競馬ブック）
                 # --------------------------
                 driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{race_id}")
                 try:
@@ -360,22 +393,7 @@ def run_all_races(year: str, month: str, day: str, place_code: str, target_races
                 danwa_dict = parse_danwa_comments(html_danwa)
 
                 # --------------------------
-                # 2) 出馬表（騎手名 & 乗り替わり）
-                #    ★ここが最重要：tbody tr まで待つ
-                # --------------------------
-                driver.get(f"https://s.keibabook.co.jp/chihou/syutuba/{race_id}")
-                try:
-                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.syutuba_sp")))
-                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.syutuba_sp tbody tr")))
-                    time.sleep(0.3)
-                except:
-                    st.warning("出馬表データの読み込みでタイムアウトしました（続行）。")
-
-                html_syutuba = driver.page_source
-                jockey_dict = parse_syutuba_jockey(html_syutuba)
-
-                # --------------------------
-                # 3) 調教
+                # 2) 調教（競馬ブック）
                 # --------------------------
                 driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{race_id}")
                 try:
@@ -389,23 +407,23 @@ def run_all_races(year: str, month: str, day: str, place_code: str, target_races
                 # 統合（馬番で揃える）
                 # --------------------------
                 all_uma = sorted(
-                    set(danwa_dict.keys()) | set(cyokyo_dict.keys()) | set(jockey_dict.keys()),
+                    set(danwa_dict.keys()) | set(cyokyo_dict.keys()) | set(netkeiba_dict.keys()),
                     key=lambda x: int(x) if str(x).isdigit() else 999,
                 )
 
                 merged_text = []
                 for uma in all_uma:
-                    j = jockey_dict.get(uma, {"name": "不明", "is_change": False})
+                    n = netkeiba_dict.get(uma, {"jockey": "不明", "trainer": "不明", "is_change": False})
+                    jockey = n.get("jockey", "不明")
+                    trainer = n.get("trainer", "不明")
+                    is_change = bool(n.get("is_change", False))
+                    alert = "【⚠️乗り替わり】" if is_change else ""
+
                     d = danwa_dict.get(uma, "（なし）")
                     c = cyokyo_dict.get(uma, "（なし）")
-                    alert = "【⚠️乗り替わり】" if j["is_change"] else ""
-
-                    if j["name"] == "不明":
-                        # デバッグ用（Streamlit logs）
-                        print(f"Warning: Jockey not found for umaban={uma} race_id={race_id}")
 
                     merged_text.append(
-                        f"▼[馬番{uma}] 騎手:{j['name']} {alert}\n"
+                        f"▼[馬番{uma}] 騎手:{jockey} {alert} / 調教師:{trainer}\n"
                         f"談話: {d}\n"
                         f"調教: {c}"
                     )
@@ -418,7 +436,7 @@ def run_all_races(year: str, month: str, day: str, place_code: str, target_races
                 prompt = (
                     f"レース名: {race_meta.get('race_name','')}\n"
                     f"条件: {race_meta.get('cond','')}\n\n"
-                    "以下の各馬のデータ（騎手、談話、調教）です。\n"
+                    "以下の各馬のデータ（騎手、調教師、談話、調教）です。\n"
                     + "\n".join(merged_text)
                 )
 
