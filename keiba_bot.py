@@ -8,7 +8,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
-from supabase import create_client, Client
 
 # ==================================================
 # 【設定エリア】secretsから読み込み
@@ -17,9 +16,6 @@ from supabase import create_client, Client
 KEIBA_ID = st.secrets.get("KEIBA_ID", "")
 KEIBA_PASS = st.secrets.get("KEIBA_PASS", "")
 DIFY_API_KEY = st.secrets.get("DIFY_API_KEY", "")
-
-SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
-SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
 
 # デフォルト設定（サイドバー等で set_race_params が呼ばれると書き換わる）
 YEAR = "2025"
@@ -34,38 +30,6 @@ def set_race_params(year, place_code, month, day):
     PLACE_CODE = str(place_code).zfill(2)
     MONTH = str(month).zfill(2)
     DAY = str(day).zfill(2)
-
-# ==================================================
-# Supabase クライアント
-# ==================================================
-@st.cache_resource
-def get_supabase_client() -> Client | None:
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        return None
-    return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-
-def save_history(year, place_code, place_name, month, day, race_num_str, race_id, ai_answer):
-    """history テーブルに 1 レース分の予想を保存する。"""
-    supabase = get_supabase_client()
-    if supabase is None:
-        return
-
-    data = {
-        "year": str(year),
-        "kai": "",          
-        "place_code": str(place_code),
-        "place_name": place_name,
-        "day": str(day),    
-        "month": str(month), 
-        "race_num": race_num_str,
-        "race_id": race_id,
-        "output_text": ai_answer,
-    }
-
-    try:
-        supabase.table("history").insert(data).execute()
-    except Exception as e:
-        print("Supabase insert error:", e)
 
 # ==================================================
 # HTML パース関数群
@@ -179,7 +143,6 @@ def parse_syutuba_jockey(html: str):
         umaban = umaban_div.get_text(strip=True)
         
         # 騎手名の取得
-        # <p class="kisyu"><strong>町田直</strong></p> のような構造を探す
         kisyu_p = sec.find("p", class_="kisyu")
         if kisyu_p:
             # <strong>タグがある場合、乗り替わりと判定
@@ -364,14 +327,12 @@ def run_all_races(target_races=None):
                 danwa_dict = parse_danwa_comments(html_danwa)
 
                 # A-2. 出馬表 (騎手・乗り替わり)
-                # ここで新しい関数を使用
                 syutuba_dict = fetch_syutuba_dict(driver, race_id)
 
                 # A-3. 調教
                 cyokyo_dict = fetch_cyokyo_dict(driver, race_id)
 
                 # A-4. データ結合
-                # 全ての辞書から馬番のリストを作成
                 all_uma = sorted(
                     list(set(list(danwa_dict.keys()) + list(cyokyo_dict.keys()) + list(syutuba_dict.keys()))),
                     key=lambda x: int(x) if x.isdigit() else 99
@@ -410,8 +371,6 @@ def run_all_races(target_races=None):
 
                 merged_text = "\n".join(merged)
                 
-                # 南関リーディングのURL（固定または動的）
-                # ここでは汎用的なリーディングページまたは指定されたURLを提示
                 nankan_leading_url = "https://www.nankankeiba.com/leading_kis/180000000003011.do"
                 
                 full_text = (
@@ -424,7 +383,7 @@ def run_all_races(target_races=None):
                     "特に以下の点を含めてください：\n"
                     "1. 「乗り替わり」が発生している馬については、そのプラス/マイナス影響を考察すること。\n"
                     "2. 騎手の該当コース適性については、一般的な傾向や南関競馬のセオリーを加味すること（以下のURLのデータ等を知識として参照）。\n"
-                    f"   参考URL: {nankan_leading_url}\n\n"
+                    f"    参考URL: {nankan_leading_url}\n\n"
                     "■出走馬詳細データ\n"
                     + merged_text
                 )
@@ -446,10 +405,11 @@ def run_all_races(target_races=None):
                 
                 if full_answer:
                     status_area.success("✅ 分析完了")
-                    save_history(
-                        YEAR, PLACE_CODE, place_name, MONTH, DAY,
-                        race_num_str, race_id, full_answer
-                    )
+                    
+                    # ★変更: 保存はせずに、コピペ用のコードブロックを表示する
+                    st.write("▼ 以下のボックスから結果をコピーできます")
+                    # language=None にすることでシンタックスハイライト（色）を消し、純粋なテキストとしてコピーしやすくします
+                    st.code(full_answer, language=None)
                 else:
                     status_area.error("⚠️ AIからの回答が空でした。")
 
