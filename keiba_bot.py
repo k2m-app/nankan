@@ -24,7 +24,7 @@ SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
 YEAR = "2025"
 PLACE_CODE = "11"  # 10:大井, 11:川崎, 12:船橋, 13:浦和
 MONTH = "12"
-DAY = "04"
+DAY = "29" # 提供されたHTMLに合わせて変更可能
 
 def set_race_params(year, place_code, month, day):
     global YEAR, PLACE_CODE, MONTH, DAY
@@ -64,13 +64,9 @@ def save_history(year, place_code, place_name, month, day, race_num_str, race_id
 # スクレイピング関数群
 # ==================================================
 
-# 1. レースID一覧を取得（日程ページから）
+# 1. レースID一覧を取得
 def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code):
-    """
-    指定された日付の日程ページ(nittei)から、対象競馬場(place_code)の全レースIDを取得する
-    """
     date_str = f"{year}{month}{day}"
-    # URL末尾の10は固定
     url = f"https://s.keibabook.co.jp/chihou/nittei/{date_str}10"
     
     st.info(f"📅 日程ページからレースIDを取得中... ({url})")
@@ -79,95 +75,102 @@ def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code):
     
     soup = BeautifulSoup(driver.page_source, "html.parser")
     race_ids = []
-    
-    # ページ内のリンクからレースIDパターン(16桁)を探す
-    # IDの5-6桁目が place_code と一致するものだけを抽出
-    
     seen = set()
+    
     for a in soup.find_all("a", href=True):
         href = a['href']
         match = re.search(r'(\d{16})', href)
         if match:
             rid = match.group(1)
-            # IDの構造: YYYY(4) + PLACE(2) + ...
-            # target_place_code (例: "11") が IDの 5,6文字目と一致するか確認
+            # IDの5-6桁目が競馬場コード
             if rid[6:8] == target_place_code:
                 if rid not in seen:
                     race_ids.append(rid)
                     seen.add(rid)
     
-    # レース番号順(IDの後ろの方にあるR番号でソート)
     race_ids.sort()
     
     if not race_ids:
-        st.warning(f"⚠️ 指定した競馬場コード({target_place_code})のレースIDが見つかりませんでした。開催がない可能性があります。")
+        st.warning(f"⚠️ 指定した競馬場コード({target_place_code})のレースIDが見つかりませんでした。")
     else:
         st.success(f"✅ {len(race_ids)} 件のレースIDを取得しました。")
         
     return race_ids
 
-# 2. 騎手情報の取得（修正済み：リンクなし対応版）
+# 2. 騎手情報の取得（提供HTML構造に完全対応）
 def parse_syutuba_jockey(html: str):
     soup = BeautifulSoup(html, "html.parser")
     jockey_info = {}
     
-    # スマートフォン版(SP)の出馬表テーブルを特定
+    # ターゲット: <table class="syutuba_sp">
     table = soup.find("table", class_="syutuba_sp")
     if not table:
         return {}
 
-    # tbodyの中身だけを見る
-    tbody = table.find("tbody")
-    if not tbody:
-        return {}
-        
-    rows = tbody.find_all("tr")
+    # 行を取得 (tbodyがある場合とない場合に対応するため、tableから直接trを探す)
+    rows = table.find_all("tr")
     
     for row in rows:
-        # 1. 馬番の取得
         tds = row.find_all("td")
         if not tds:
             continue
             
-        # 1列目が馬番（テキストが数字かチェック）
+        # 1列目が馬番（数字）であるか確認
         umaban_text = tds[0].get_text(strip=True)
         if not umaban_text.isdigit():
             continue
-            
+        
         umaban = umaban_text
 
-        # 2. 騎手情報の取得
-        # <td class="left"> の中にある <p class="kisyu"> を探す
+        # 騎手欄は <p class="kisyu">
         kisyu_p = row.find("p", class_="kisyu")
         
         if kisyu_p:
             name = ""
             is_change = False
             
-            # アンカータグ(a)があるか確認
+            # 優先1: <a>タグを探す (HTMLではここに入っている)
             anchor = kisyu_p.find("a")
             
             if anchor:
-                # パターンA: リンクがある場合
+                # <a>タグの中のテキストが騎手名
                 name = anchor.get_text(strip=True)
-                # 乗り替わり判定 (aタグの中、またはpタグ直下にstrongがあるか)
-                if anchor.find("strong") or kisyu_p.find("strong"):
-                    is_change = True
-            else:
-                # パターンB: リンクがない場合（ここを修正）
-                # pタグのテキストを直接取得
-                name = kisyu_p.get_text(strip=True)
-                # 乗り替わり判定
-                if kisyu_p.find("strong"):
+                
+                # 乗り替わり判定: <a>の中に<strong>があるか
+                # 例: <a ...><strong>松崎正</strong></a>
+                if anchor.find("strong"):
                     is_change = True
             
-            # 名前が取得できていれば保存
+            # 優先2: <a>がない場合 (リンク切れ騎手など)
+            else:
+                # テキスト全体を取得: "牡3 ▲小野俊 53" のようになる
+                full_text = kisyu_p.get_text(" ", strip=True)
+                
+                # <strong>があれば乗り替わり
+                if kisyu_p.find("strong"):
+                    is_change = True
+                    name = kisyu_p.find("strong").get_text(strip=True)
+                else:
+                    # スペースで分割して、真ん中あたりを取得する簡易ロジック
+                    # 例: ["牡3", "騎手名", "53"]
+                    parts = full_text.split()
+                    if len(parts) >= 2:
+                        # 数字を含まないパーツを名前候補とする（簡易的）
+                        for part in parts:
+                            if not any(char.isdigit() for char in part) and part not in ["牡", "牝", "セン"]:
+                                name = part
+                                break
+                        if not name:
+                            name = parts[1] if len(parts) > 1 else full_text
+                    else:
+                        name = full_text
+
             if name:
                 jockey_info[umaban] = {"name": name, "is_change": is_change}
             
     return jockey_info
 
-# 3. 談話・調教・レース情報のパース
+# 3. その他情報のパース
 def parse_race_info(html: str):
     soup = BeautifulSoup(html, "html.parser")
     racetitle = soup.find("div", class_="racetitle")
@@ -184,7 +187,6 @@ def parse_race_info(html: str):
 def parse_danwa_comments(html: str):
     soup = BeautifulSoup(html, "html.parser")
     danwa_dict = {}
-    # 談話テーブルの構造に合わせて取得
     table = soup.find("table", class_="danwa")
     if table and table.tbody:
         current_uma = None
@@ -217,7 +219,6 @@ def parse_cyokyo(html: str):
         umaban = uma_td.get_text(strip=True)
         bamei = name_td.get_text(" ", strip=True)
         
-        # 短評と詳細
         tanpyo = h_row.find("td", class_="tanpyo").get_text(strip=True) if h_row.find("td", class_="tanpyo") else ""
         detail = rows[1].get_text(" ", strip=True) if len(rows) > 1 else ""
         
@@ -266,7 +267,6 @@ def run_all_races(target_races=None):
     driver = webdriver.Chrome(options=options)
 
     try:
-        # 1. ログイン
         st.info("🔑 ログイン中...")
         driver.get("https://s.keibabook.co.jp/login/login")
         WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.NAME, "login_id"))).send_keys(KEIBA_ID)
@@ -274,22 +274,17 @@ def run_all_races(target_races=None):
         driver.find_element(By.CSS_SELECTOR, "input[type='submit']").click()
         time.sleep(1)
 
-        # 2. 日程ページからIDリストを取得
         race_ids = fetch_race_ids_from_schedule(driver, YEAR, MONTH, DAY, PLACE_CODE)
         
         if not race_ids:
             return
 
-        # 3. 各レースをループ処理
         for i, race_id in enumerate(race_ids):
-            race_num = i + 1  # リスト順＝レース順と仮定
-            
-            # 指定されたレース以外はスキップ
+            race_num = i + 1
             if target_races is not None and race_num not in target_races:
                 continue
 
             race_num_str = f"{race_num:02}"
-            
             st.markdown(f"### {place_name} {race_num}R (ID: {race_id})")
             status_area = st.empty()
             result_area = st.empty()
@@ -297,21 +292,20 @@ def run_all_races(target_races=None):
             try:
                 status_area.info("📡 データ収集中...")
                 
-                # A. 談話ページ (ここからレース情報も取る)
+                # 談話ページ
                 driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{race_id}")
                 html_danwa = driver.page_source
                 race_meta = parse_race_info(html_danwa)
                 danwa_dict = parse_danwa_comments(html_danwa)
                 
-                # B. 出馬表ページ (騎手情報) - /1/無し注意
+                # 出馬表ページ
                 driver.get(f"https://s.keibabook.co.jp/chihou/syutuba/{race_id}")
                 jockey_dict = parse_syutuba_jockey(driver.page_source)
                 
-                # C. 調教ページ
+                # 調教ページ
                 driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{race_id}")
                 cyokyo_dict = parse_cyokyo(driver.page_source)
                 
-                # データ結合
                 merged_text = []
                 all_uma = sorted(list(set(list(danwa_dict.keys()) + list(cyokyo_dict.keys()) + list(jockey_dict.keys()))), 
                                  key=lambda x: int(x) if x.isdigit() else 99)
@@ -328,15 +322,13 @@ def run_all_races(target_races=None):
                     status_area.warning("データなしスキップ")
                     continue
 
-                # プロンプト作成
                 prompt = (
                     f"レース名: {race_meta.get('race_name','')}\n"
                     f"条件: {race_meta.get('cond','')}\n\n"
-                    "以下は出走全頭のデータ（騎手、調教師、談話、調教）です。\n"
+                    "以下の各馬のデータ（騎手、調教師、談話、調教）です。\n"
                     + "\n".join(merged_text)
                 )
                 
-                # AI分析
                 status_area.info("🤖 AI分析中...")
                 full_ans = ""
                 for chunk in stream_dify_workflow(prompt):
