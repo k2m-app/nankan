@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from supabase import create_client, Client
 
 # ==================================================
-# 1. 設定・Secrets
+# 1. 設定エリア
 # ==================================================
 
 def check_password():
@@ -34,9 +34,12 @@ def check_password():
 
 if not check_password(): st.stop()
 
+# Secrets
 KEIBA_ID = st.secrets.get("KEIBA_ID", "")
 KEIBA_PASS = st.secrets.get("KEIBA_PASS", "")
 DIFY_API_KEY = st.secrets.get("DIFY_API_KEY", "")
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
 
 PLACE_NAMES = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
 
@@ -69,7 +72,6 @@ def get_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,1080")
-    # Bot対策回避
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     return webdriver.Chrome(options=options)
 
@@ -114,81 +116,77 @@ def get_race_meta(html):
     return {"name": rname, "cond": cond}
 
 # ==================================================
-# 3. データ取得ロジック (確実性重視)
+# 3. データ取得ロジック (HTML解析)
 # ==================================================
 
 def parse_syutuba_page(html):
     """
-    【出馬表ページ】から 馬番・馬名・騎手・乗り替わり を取得
-    ※テーブル形式(syutuba_sp)とブロック形式(div.section)の両対応
+    【出馬表ページ】解析
+    提供されたHTMLに基づき、<table class="syutuba_sp"> を解析する
     """
     soup = BeautifulSoup(html, "html.parser")
     data = {}
 
-    # --- パターンA: テーブル形式 (syutuba_sp) ---
+    # 提供されたHTMLにあるテーブルクラス
     table = soup.find("table", class_="syutuba_sp")
-    if table:
-        for row in table.find_all("tr"):
-            # 馬番取得 (class="umaban" または 1列目の数字)
-            umaban = None
-            u_td = row.find("td", class_="umaban")
-            if u_td:
-                umaban = u_td.get_text(strip=True)
-            else:
-                tds = row.find_all("td")
-                if tds and tds[0].get_text(strip=True).isdigit():
-                    umaban = tds[0].get_text(strip=True)
-            
-            if not umaban: continue
+    
+    if not table:
+        return {}
 
-            # 馬名
-            b_td = row.find("td", class_="bamei")
-            # クラスがない場合は適当に探す（通常はclass="bamei"がある）
-            horse_name = b_td.get_text(strip=True) if b_td else "不明"
-            if horse_name == "不明":
-                # リンク内の馬名を探す
-                a_tag = row.find("a", href=re.compile("uma"))
-                if a_tag: horse_name = a_tag.get_text(strip=True)
+    # tbody内の行を取得
+    rows = table.find("tbody").find_all("tr")
+    
+    for row in rows:
+        # 1. 馬番の取得 (最初のtd)
+        tds = row.find_all("td")
+        if not tds: continue
+        
+        # class="waku1" 等がついていることが多いが、位置で取得が確実
+        umaban = tds[0].get_text(strip=True)
+        if not umaban.isdigit(): continue # ヘッダー行などの除外
 
-            # 騎手
-            k_p = row.find("p", class_="kisyu")
-            jockey = "不明"
-            is_change = False
-            if k_p:
-                jockey = k_p.get_text(strip=True)
-                # 乗り替わり判定 (strong, b, class="red")
-                if k_p.find(["strong", "b"]) or "red" in k_p.get("class", []):
+        # 2. 馬名と騎手の取得 (class="left" のtd内にある)
+        info_td = row.find("td", class_="left")
+        if not info_td: continue
+
+        # 馬名 <p class="kbamei">
+        kbamei_p = info_td.find("p", class_="kbamei")
+        horse_name = kbamei_p.get_text(strip=True) if kbamei_p else "不明"
+
+        # 騎手 <p class="kisyu">
+        kisyu_p = info_td.find("p", class_="kisyu")
+        jockey = "不明"
+        is_change = False
+        
+        if kisyu_p:
+            # <a>タグの中に騎手名がある
+            a_tag = kisyu_p.find("a")
+            if a_tag:
+                jockey = a_tag.get_text(strip=True)
+                # 乗り替わり判定: <a>の中に <strong> または <b> があるか
+                if a_tag.find(["strong", "b"]):
                     is_change = True
-
-            data[umaban] = {"horse": horse_name, "jockey": jockey, "is_change": is_change}
+            else:
+                # リンクがない場合のバックアップ
+                # "牡2 桑村真 55" のようになっているため、単純取得は危険だがとりあえず取得
+                jockey = kisyu_p.get_text(strip=True)
             
-    # --- パターンB: テーブルが取れなかった場合、divブロックを探す ---
-    if not data:
-        sections = soup.find_all("div", class_="section")
-        for sec in sections:
-            u_div = sec.find("div", class_="umaban")
-            if not u_div: continue
-            umaban = u_div.get_text(strip=True)
-            
-            # 馬名
-            h_div = sec.find("div", class_="bamei")
-            horse_name = h_div.get_text(strip=True) if h_div else "不明"
-            
-            # 騎手
-            k_p = sec.find("p", class_="kisyu")
-            jockey = k_p.get_text(strip=True) if k_p else "不明"
-            is_change = False
-            if k_p and (k_p.find(["strong", "b"]) or "red" in k_p.get("class", [])):
+            # 親タグレベルでの強調チェック
+            if kisyu_p.find(["strong", "b"]):
                 is_change = True
-            
-            data[umaban] = {"horse": horse_name, "jockey": jockey, "is_change": is_change}
+
+        data[umaban] = {
+            "horse": horse_name,
+            "jockey": jockey,
+            "is_change": is_change
+        }
             
     return data
 
 def parse_danwa_page(html):
     """
-    【談話ページ】から 厩舎の話(コメント) を取得
-    ※調教師名はコメント文脈から抽出
+    【談話ページ】解析
+    調教師名はこのページのコメント本文から抽出する
     """
     soup = BeautifulSoup(html, "html.parser")
     data = {}
@@ -196,16 +194,14 @@ def parse_danwa_page(html):
     if table and table.tbody:
         current_uma = None
         for row in table.tbody.find_all("tr"):
-            # 馬番行
             u_td = row.find("td", class_="umaban")
             if u_td:
                 current_uma = u_td.get_text(strip=True)
                 continue
-            # コメント行
             txt_td = row.find("td", class_="danwa")
             if txt_td and current_uma:
                 text = txt_td.get_text(strip=True)
-                # 調教師名の抽出 (例: "〇〇師" を探す)
+                # コメント内の「〇〇師」を正規表現で探す
                 trainer = "不明"
                 m = re.search(r'(\S+師)', text)
                 if m: trainer = m.group(1)
@@ -216,20 +212,17 @@ def parse_danwa_page(html):
 
 def parse_cyokyo_page(html):
     """
-    【調教ページ】から 調教タイム・短評 を取得
+    【調教ページ】解析
     """
     soup = BeautifulSoup(html, "html.parser")
     data = {}
-    # 複数のテーブルがある場合に対応
     tables = soup.find_all("table", class_="cyokyo")
     for tbl in tables:
         tbody = tbl.find("tbody")
         if not tbody: continue
         rows = tbody.find_all("tr", recursive=False)
-        # 2行1セット (1行目:馬番・馬名・短評 / 2行目:詳細タイム)
         if len(rows) < 2: continue
         
-        # 1行目解析
         r1 = rows[0]
         u_td = r1.find("td", class_="umaban")
         if not u_td: continue
@@ -238,7 +231,6 @@ def parse_cyokyo_page(html):
         tanpyo_td = r1.find("td", class_="tanpyo")
         tanpyo = tanpyo_td.get_text(strip=True) if tanpyo_td else ""
         
-        # 2行目解析 (詳細)
         r2 = rows[1]
         detail = r2.get_text(" ", strip=True)
         
@@ -334,13 +326,11 @@ if st.button("🚀 分析開始", type="primary"):
                     cyokyo_data = parse_cyokyo_page(driver.page_source)
                     
                     # 4. 結合
-                    # 全ページの馬番セット (キーが文字列か数値か注意してソート)
                     all_keys = set(syutuba_data.keys()) | set(danwa_data.keys()) | set(cyokyo_data.keys())
                     sorted_umas = sorted(list(all_keys), key=lambda x: int(x) if x.isdigit() else 999)
                     
                     lines = []
                     for u in sorted_umas:
-                        # 各辞書からget
                         s = syutuba_data.get(u, {})
                         d = danwa_data.get(u, {})
                         c = cyokyo_data.get(u, {})
@@ -350,7 +340,7 @@ if st.button("🚀 分析開始", type="primary"):
                         change = "【⚠️乗り替わり】" if s.get("is_change") else ""
                         
                         comment = d.get("comment", "なし")
-                        trainer = d.get("trainer", "不明") # コメントから抽出した師
+                        trainer = d.get("trainer", "不明") 
                         
                         cyokyo = f"{c.get('tanpyo','')} {c.get('time','')}"
                         
@@ -368,8 +358,8 @@ if st.button("🚀 分析開始", type="primary"):
                         
                     prompt = (
                         f"レース: {meta.get('name','')}\n条件: {meta.get('cond','')}\n\n"
-                        "以下のデータ(騎手,調教師,厩舎の話,調教)から推奨馬を予想せよ。\n"
-                        "特に「乗り替わり」の有無、調教師のコメントの感触を重視すること。\n\n"
+                        "レース全出馬表データ(騎手,調教師,厩舎の話,調教)。\n"
+                        "調教師名は「厩舎の話」に含まれている。\n"
                         + "\n".join(lines)
                     )
                     
