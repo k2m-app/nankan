@@ -13,6 +13,9 @@ from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 # ==================================================
 # 【設定】Secrets読み込み
 # ==================================================
@@ -218,7 +221,7 @@ def parse_cyokyo(html: str):
     return cyokyo_dict
 
 # ==================================================
-# 地方競馬公式（keiba.go.jp）：DOMで出馬表を正確にパース
+# 地方競馬公式（keiba.go.jp）：DOMで出馬表を「確実に」パース（差し替え版）
 # ==================================================
 _KEIBAGO_UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -233,9 +236,48 @@ def _norm_name(s: str) -> str:
     s = s.replace("▲", "").replace("△", "").replace("☆", "").replace("◇", "")
     return s.strip()
 
+def _build_requests_session() -> requests.Session:
+    """
+    一時的な 5xx/429 や瞬断に強くするため Retry を入れる
+    """
+    sess = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+_WEIGHT_RE = re.compile(r"^[☆▲△◇]?\s*\d{1,2}\.\d$")       # 55.0 / ☆ 53.0 等
+_PREV_JOCKEY_RE = re.compile(r"\d+人\s+([☆▲△◇]?\s*\S+)\s+\d{1,2}\.\d")  # "5人 ▲高橋優 52.0" 等
+
+def _extract_jockey_from_cell(td) -> str:
+    """
+    負担重量・所属・成績が混ざるセルから騎手名だけ安定抽出
+    """
+    lines = [x.strip() for x in td.get_text("\n", strip=True).split("\n") if x.strip()]
+    # 先頭の負担重量っぽい行を除去
+    lines2 = [ln for ln in lines if not _WEIGHT_RE.match(ln)]
+    if lines2:
+        return lines2[0].replace(" ", "")
+    return "不明"
+
 def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int, baba_code: str):
     """
-    keiba.go.jp DebaTableSmall を「表の列」で堅牢に読む版
+    keiba.go.jp DebaTableSmall を堅牢に読む版（rowspan/列ズレ耐性あり）
+
+    ポイント：
+    - 「font.bamei」がある行＝馬行 として確実に拾う（ヘッダ行などを除外）
+    - rowspan で枠セルが欠ける行（同枠の2頭目など）は、直前枠 last_waku を継承
+    - 列位置を固定せず、「枠セルあり/なし」でオフセットを切り替える
+    - requests Retry で瞬間的な 5xx/429 に耐える
     """
     date_str = f"{year}/{str(month).zfill(2)}/{str(day).zfill(2)}"
     url = (
@@ -243,71 +285,97 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
         f"?k_raceDate={requests.utils.quote(date_str)}&k_raceNo={race_no}&k_babaCode={baba_code}"
     )
 
-    r = requests.get(url, headers=_KEIBAGO_UA, timeout=25)
+    sess = _build_requests_session()
+    r = sess.get(url, headers=_KEIBAGO_UA, timeout=25)
     r.raise_for_status()
     r.encoding = r.apparent_encoding or "utf-8"
     soup = BeautifulSoup(r.text, "html.parser")
 
+    # ヘッダ（任意）
     header = ""
     top_bs = soup.select_one("table.bs")
     if top_bs:
         header = top_bs.get_text(" ", strip=True)
 
-    main_table = soup.select_one("td.dbtbl table.bs")
+    # 出馬表テーブル本体
+    main_table = soup.select_one("td.dbtbl table.bs[border='1']")
     if not main_table:
         main_table = soup.select_one("table.bs[border='1']")
 
     horses = {}
+    last_waku = ""  # rowspan 欠け行の枠継承用
 
-    prev_jockey_re = re.compile(r"\d+人\s+([☆▲△◇]?\S+)\s+\d{1,2}\.\d")
+    if not main_table:
+        return header, horses, url
 
-    if main_table:
-        for tr in main_table.find_all("tr"):
-            tds = tr.find_all("td", recursive=False)
-            if len(tds) < 6:
-                continue
+    for tr in main_table.find_all("tr"):
+        # 馬行判定：馬名が入る font.bamei がある行だけ
+        if not tr.select_one("font.bamei"):
+            continue
 
+        tds = tr.find_all("td", recursive=False)
+        if len(tds) < 8:
+            continue
+
+        # 枠セルあり/なし判定（rowspan の2頭目は枠セルが無い）
+        first_txt = tds[0].get_text(strip=True)
+        waku_present = first_txt.isdigit() and len(tds) >= 9
+        if waku_present:
+            second_txt = tds[1].get_text(strip=True)
+            if not second_txt.isdigit():
+                waku_present = False
+
+        if waku_present:
             waku = tds[0].get_text(strip=True)
             umaban = tds[1].get_text(strip=True)
+            horse_td = tds[2]
+            trainer_td = tds[3]
+            jockey_td = tds[4]
+            zenso_td = tds[8] if len(tds) > 8 else None
+            last_waku = waku
+        else:
+            waku = last_waku or ""
+            umaban = tds[0].get_text(strip=True)
+            horse_td = tds[1]
+            trainer_td = tds[2]
+            jockey_td = tds[3]
+            zenso_td = tds[7] if len(tds) > 7 else None
 
-            if not (waku.isdigit() and umaban.isdigit()):
-                continue
+        if not umaban.isdigit():
+            continue
 
-            horse = ""
-            bamei_tag = tds[2].select_one("font.bamei b")
-            if bamei_tag:
-                horse = bamei_tag.get_text(strip=True)
-            else:
-                horse = tds[2].get_text(" ", strip=True)
+        # 馬名
+        bamei_tag = horse_td.select_one("font.bamei b")
+        horse = bamei_tag.get_text(strip=True) if bamei_tag else horse_td.get_text(" ", strip=True)
 
-            trainer_raw = tds[3].get_text(" ", strip=True)
-            trainer = trainer_raw.split("（")[0].strip()
+        # 調教師（所属括弧は落とす）
+        trainer_raw = trainer_td.get_text(" ", strip=True)
+        trainer = trainer_raw.split("（")[0].strip() if trainer_raw else "不明"
 
-            jockey_lines = [x.strip() for x in tds[4].get_text("\n", strip=True).split("\n") if x.strip()]
-            jockey = "不明"
-            if len(jockey_lines) >= 2:
-                jockey = jockey_lines[1]
+        # 騎手
+        jockey = _extract_jockey_from_cell(jockey_td)
 
-            prev_jockey = ""
-            if len(tds) >= 9:
-                zenso_txt = tds[8].get_text(" ", strip=True)
-                m = prev_jockey_re.search(zenso_txt)
-                if m:
-                    prev_jockey = m.group(1).strip()
+        # 前走騎手（前走欄から抽出）
+        prev_jockey = ""
+        if zenso_td:
+            zenso_txt = zenso_td.get_text(" ", strip=True)
+            m = _PREV_JOCKEY_RE.search(zenso_txt)
+            if m:
+                prev_jockey = m.group(1).strip().replace(" ", "")
 
-            cj = _norm_name(jockey)
-            pj = _norm_name(prev_jockey)
-            is_change = bool(pj and cj and pj != cj)
+        cj = _norm_name(jockey)
+        pj = _norm_name(prev_jockey)
+        is_change = bool(pj and cj and pj != cj)
 
-            horses[str(umaban)] = {
-                "waku": str(waku),
-                "umaban": str(umaban),
-                "horse": horse,
-                "trainer": trainer if trainer else "不明",
-                "jockey": jockey if jockey else "不明",
-                "prev_jockey": prev_jockey,
-                "is_change": is_change,
-            }
+        horses[str(umaban)] = {
+            "waku": str(waku),
+            "umaban": str(umaban),
+            "horse": horse,
+            "trainer": trainer if trainer else "不明",
+            "jockey": jockey if jockey else "不明",
+            "prev_jockey": prev_jockey,
+            "is_change": is_change,
+        }
 
     return header, horses, url
 
@@ -511,28 +579,23 @@ def run_all_races(
                 full_ans = ""
 
                 if ui:
-                    # uiモードだけ進捗表示（▌）
                     result_area = st.empty()
                     for chunk in stream_dify_workflow(prompt):
                         full_ans += chunk
                         result_area.markdown(full_ans + "▌")
                     result_area.markdown(full_ans)
                 else:
-                    # 静かに全部集める
                     for chunk in stream_dify_workflow(prompt):
                         full_ans += chunk
 
                 full_ans = (full_ans or "").strip()
-
                 if full_ans == "":
                     full_ans = "⚠️ AIの出力が空でした（Dify応答なし/エラーの可能性）"
 
                 _ui_success(ui, "✅ 完了")
 
-                # 保存
                 save_history(year, place_code, place_name, month, day, race_num_str, race_id, full_ans)
 
-                # 返却用ブロックを追加（★ここがポイント）
                 block = f"【{place_name} {race_num}R】\n{full_ans}"
                 result_blocks.append(block)
 
@@ -549,7 +612,6 @@ def run_all_races(
         except:
             pass
 
-    # ★必ず文字列を返す（None禁止）
     return "\n\n".join(result_blocks).strip()
 
 def run_races_iter(
@@ -704,4 +766,3 @@ def run_races_iter(
             driver.quit()
         except:
             pass
-
