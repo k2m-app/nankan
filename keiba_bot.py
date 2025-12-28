@@ -187,7 +187,7 @@ def parse_cyokyo(html: str):
     return cyokyo_dict
 
 # ==================================================
-# 地方競馬公式（keiba.go.jp）：DebaTableSmall を堅牢パース
+# 地方競馬公式（keiba.go.jp）：DOMで出馬表を正確にパース（ここが大改修）
 # ==================================================
 _KEIBAGO_UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -196,8 +196,7 @@ _KEIBAGO_UA = {
 }
 
 def _norm_name(s: str) -> str:
-    s = (s or "").strip()
-    s = s.replace("\u3000", " ")
+    s = (s or "").strip().replace("\u3000", " ")
     s = re.sub(r"\s+", " ", s)
     # 減量記号を除去（比較用）
     s = s.replace("▲", "").replace("△", "").replace("☆", "").replace("◇", "")
@@ -205,16 +204,16 @@ def _norm_name(s: str) -> str:
 
 def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int, baba_code: str):
     """
-    DebaTableSmall から
-      - レース見出し（ページ先頭）
-      - {馬番: {horse, jockey, trainer, prev_jockey, is_change}}
-    を返す
+    keiba.go.jp DebaTableSmall を「表の列」で堅牢に読む版
 
-    乗り替わり判定：
-      - ブロック内で最初に出現する「前走」の騎手名（例: '12/14 8人 ▲小野俊 53.0' の小野俊）
-      - 現在騎手と不一致なら is_change=True
+    返り値:
+      header: str
+      horses: { "馬番": {horse, jockey, trainer, prev_jockey, is_change, waku, umaban} }
+      url: str
+
+    前走騎手:
+      「前走」列のテキスト内にある  "◯人　(騎手名) 55.0" から抽出
     """
-    # YYYY/MM/DD を URLに入れる
     date_str = f"{year}/{str(month).zfill(2)}/{str(day).zfill(2)}"
     url = (
         "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTableSmall"
@@ -224,133 +223,85 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
     r = requests.get(url, headers=_KEIBAGO_UA, timeout=25)
     r.raise_for_status()
     r.encoding = r.apparent_encoding or "utf-8"
-
     soup = BeautifulSoup(r.text, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
 
-    # 見出し（先頭数行を連結）
-    header = " / ".join(lines[:5])
+    # --- ヘッダー（上の開催情報） ---
+    header = ""
+    # 先頭の「2025年12月26日（金） 大井 第1競走 ...」が入る table.bs の1行目を拾う
+    top_bs = soup.select_one("table.bs")
+    if top_bs:
+        header = top_bs.get_text(" ", strip=True)
 
-    # 1行目の馬ブロック開始（例: "1 1 オルフェーヴル   牝 3"）
-    start_re = re.compile(r"^(\d+)\s+(\d+)\s+(.+)$")
-
-    # 前走行の騎手抽出（例: "12/14 8人 ▲小野俊 53.0"）
-    prev_jockey_re = re.compile(r"^\d{1,2}/\d{1,2}\s+\d+人\s+([☆▲△◇]?\S+)\s+\d{1,2}\.\d$")
+    # --- 出馬表の「枠/馬番/馬名/調教師/騎手/前走...」が載る本体表 ---
+    # class="dbtbl" の中に table(border=1) があり、その中の tr が馬ごとの行
+    main_table = soup.select_one("td.dbtbl table.bs")
+    if not main_table:
+        # HTMLが少し違う場合の保険
+        main_table = soup.select_one("table.bs[border='1']")
 
     horses = {}
-    i = 0
-    cur = None
 
-    def _finalize(cur_obj):
-        if not cur_obj:
-            return
-        umaban = cur_obj.get("umaban")
-        if not umaban:
-            return
-        # 乗り替わり判定
-        cj = _norm_name(cur_obj.get("jockey", ""))
-        pj = _norm_name(cur_obj.get("prev_jockey", ""))
-        is_change = bool(pj and cj and pj != cj)
-        cur_obj["is_change"] = is_change
-        horses[str(umaban)] = cur_obj
+    # 前走欄から「前走騎手」を拾う
+    # 例: "2/6　5人　桑村真 55.0" → 桑村真
+    prev_jockey_re = re.compile(r"\d+人\s+([☆▲△◇]?\S+)\s+\d{1,2}\.\d")
 
-    while i < len(lines):
-        ln = lines[i]
+    if main_table:
+        for tr in main_table.find_all("tr"):
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) < 6:
+                continue
 
-        m = start_re.match(ln)
-        if m:
-            # 新しい馬ブロック開始
-            _finalize(cur)
-            waku = m.group(1)
-            umaban = m.group(2)
+            # 先頭2列が「枠」「馬番」になっている “馬の行” だけ処理する
+            waku = tds[0].get_text(strip=True)
+            umaban = tds[1].get_text(strip=True)
 
-            cur = {
-                "waku": waku,
-                "umaban": umaban,
-                "horse": "",
-                "jockey": "",
-                "trainer": "",
-                "prev_jockey": "",
-                "is_change": False,
+            if not (waku.isdigit() and umaban.isdigit()):
+                continue
+
+            # 馬名（font.bamei > b の中）
+            horse = ""
+            bamei_tag = tds[2].select_one("font.bamei b")
+            if bamei_tag:
+                horse = bamei_tag.get_text(strip=True)
+            else:
+                # 保険：td内テキストから推定（馬名が<b>になってないケース）
+                horse = tds[2].get_text(" ", strip=True)
+
+            # 調教師：td[3] 例: "月岡健（大井）" → 月岡健
+            trainer_raw = tds[3].get_text(" ", strip=True)
+            trainer = trainer_raw.split("（")[0].strip()
+
+            # 騎手：td[4] は "55.0<br>桑村真<br>（大井）..." のように改行区切り
+            jockey_lines = [x.strip() for x in tds[4].get_text("\n", strip=True).split("\n") if x.strip()]
+            jockey = "不明"
+            # だいたい [斤量, 騎手名, (所属), 成績] の順なので2番目が騎手名になりやすい
+            if len(jockey_lines) >= 2:
+                jockey = jockey_lines[1]
+
+            # 前走騎手：前走列（通常は td[8]）から抽出
+            prev_jockey = ""
+            # 列構成が固定（枠/馬番/馬名/調教師/騎手/馬体重/変更/着別/前走/前々走/3走前/4走前）
+            if len(tds) >= 9:
+                zenso_txt = tds[8].get_text(" ", strip=True)
+                m = prev_jockey_re.search(zenso_txt)
+                if m:
+                    prev_jockey = m.group(1).strip()
+
+            # 乗り替わり判定（前走騎手が取れていて、現在騎手と違う）
+            cj = _norm_name(jockey)
+            pj = _norm_name(prev_jockey)
+            is_change = bool(pj and cj and pj != cj)
+
+            horses[str(umaban)] = {
+                "waku": str(waku),
+                "umaban": str(umaban),
+                "horse": horse,
+                "trainer": trainer if trainer else "不明",
+                "jockey": jockey if jockey else "不明",
+                "prev_jockey": prev_jockey,
+                "is_change": is_change,
             }
 
-            # 次行：馬名
-            if i + 1 < len(lines):
-                cur["horse"] = lines[i + 1].strip()
-
-            # 調教師は「馬主 生産牧場 調教師」が同一行に出ることが多い
-            # 例: "池谷誠一   上水牧場 福田真"
-            # → 行末の2〜4文字程度の日本語姓名を調教師として拾う（所属行は別にある）
-            # ただし確実性のため、「（大井）」等の所属行の直前あたりも探す
-            trainer = ""
-            jockey = ""
-
-            # ざっくりこのブロックの前半（次の start まで or 80行）を走査して
-            #  - 「(所属) 斤量」の直後の行を騎手とみなす
-            #  - 「(所属) 斤量」の直前の行を含む文脈で調教師を拾う
-            scan_end = min(len(lines), i + 120)
-            k = i
-            while k < scan_end:
-                ln2 = lines[k]
-
-                # 騎手：斤量行（例: "(大井) 54.0" / "(大井)▲ 53.0"）の次行
-                if re.search(r"^\（.*\）\s*[☆▲△◇]?\s*\d{1,2}\.\d$", ln2):
-                    if k + 1 < len(lines):
-                        jockey = lines[k + 1].strip()
-                        cur["jockey"] = jockey
-
-                # 調教師：調教師が含まれる行（馬主/生産者/調教師が並ぶ行）を拾う
-                # 例: "... 上水牧場 福田真"
-                # → 末尾トークンを調教師として採用
-                if "牧場" in ln2 or "ファーム" in ln2 or "株式会社" in ln2 or "（有）" in ln2 or "（株）" in ln2:
-                    parts = re.split(r"\s+", ln2)
-                    if len(parts) >= 2:
-                        cand = parts[-1].strip()
-                        # 所属括弧が混じるケースは除外
-                        if "（" not in cand and "）" not in cand and len(cand) <= 6:
-                            trainer = cand
-                            cur["trainer"] = trainer
-
-                # 前走騎手：最初に見つかったものだけ採用
-                if not cur["prev_jockey"]:
-                    pm = prev_jockey_re.match(ln2)
-                    if pm:
-                        cur["prev_jockey"] = pm.group(1).strip()
-
-                # 次の馬ブロック始まりで打ち切り
-                if k > i and start_re.match(ln2):
-                    break
-
-                k += 1
-
-            # 調教師がまだ空なら、所属行の「一つ前」を調教師候補として拾う保険
-            if not cur["trainer"]:
-                # 所属行 "(大井) 54.0" を見つけたら、その2つ前くらいに調教師がいることが多い
-                for kk in range(i, min(len(lines), i + 80)):
-                    if re.search(r"^\（.*\）\s*[☆▲△◇]?\s*\d{1,2}\.\d$", lines[kk]):
-                        # 2つ前の行末
-                        if kk - 2 >= 0:
-                            ln_tr = lines[kk - 2]
-                            parts = re.split(r"\s+", ln_tr)
-                            if parts:
-                                cand = parts[-1].strip()
-                                if "（" not in cand and "）" not in cand and len(cand) <= 6:
-                                    cur["trainer"] = cand
-                        break
-
-            i += 1
-            continue
-
-        # ブロック中の前走騎手（最初の1回だけ）
-        if cur and not cur["prev_jockey"]:
-            pm = prev_jockey_re.match(ln)
-            if pm:
-                cur["prev_jockey"] = pm.group(1).strip()
-
-        i += 1
-
-    _finalize(cur)
     return header, horses, url
 
 # ==================================================
@@ -464,7 +415,8 @@ def run_all_races(year: str, month: str, day: str, place_code: str, target_races
                     baba_code=str(baba_code),
                 )
                 st.caption(f"keiba.go.jp: {keibago_url}")
-                st.caption(f"keiba.go.jp header: {header}")
+                if header:
+                    st.caption(f"keiba.go.jp header: {header}")
 
                 if not keibago_dict:
                     st.warning("⚠️ keiba.go.jp から出馬表が取れませんでした（続行しますが騎手/調教師が不明になります）")
@@ -516,9 +468,6 @@ def run_all_races(year: str, month: str, day: str, place_code: str, target_races
 
                     d = danwa_dict.get(uma, "（なし）")
                     c = cyokyo_dict.get(uma, "（なし）")
-
-                    if jockey == "不明":
-                        print(f"Warning: keiba.go.jp jockey not found for umaban={uma} race_num={race_num}")
 
                     merged_text.append(
                         f"▼[馬番{uma}] 馬名:{horse} 騎手:{jockey} {alert} 調教師:{trainer}\n"
