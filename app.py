@@ -9,7 +9,7 @@ import re
 # ページ設定（スマホ見やすさに効く）
 # ==================================================
 st.set_page_config(
-    page_title="南関東競馬AI予想",
+    page_title="NANKAN AI",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -27,7 +27,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.title("🐎 南関東競馬AI予想アプリ")
+st.title("NANKAN AI")
 
 # ==================================================
 # サイドバー：開催設定
@@ -89,7 +89,7 @@ st.sidebar.caption("※ 設定後、下の「分析スタート」で実行し�
 # メイン：実行/表示
 # ==================================================
 st.write(f"### 設定: {year}年 {month}月{day}日 {place_name}")
-st.markdown('<div class="small-muted">結果は下にまとまって表示され、ワンクリックでコピーできます。</div>', unsafe_allow_html=True)
+st.markdown('<div class="small-muted">結果コピーは下</div>', unsafe_allow_html=True)
 st.write("")
 
 run = st.button("分析スタート 🚀")
@@ -159,7 +159,7 @@ def _render_copy_button(text: str, button_label: str = "📎 分析結果をコ�
 
 if run:
     if not target_races:
-        st.warning("少なくとも1つのレースを選んでください。")
+        st.warning("レースを選んでください")
     else:
         with st.spinner("分析中..."):
             try:
