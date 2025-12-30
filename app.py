@@ -1,8 +1,6 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import keiba_bot
 from datetime import datetime, timedelta, timezone
-import html
 import re
 
 # ==================================================
@@ -81,7 +79,7 @@ st.sidebar.caption("※ 設定後、下の「分析スタート」で実行し�
 # メイン
 # ==================================================
 st.write(f"### 設定: {year}年 {month}月{day}日 {place_name}")
-st.markdown('<div class="small-muted">結果コピーは下</div>', unsafe_allow_html=True)
+st.markdown('<div class="small-muted">分析完了後、下部にコピー用エリアが表示されます</div>', unsafe_allow_html=True)
 st.write("")
 
 run = st.button("分析スタート 🚀")
@@ -92,40 +90,6 @@ def _normalize_text(s: str) -> str:
     s = s.replace("\r\n", "\n")
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
-
-def _render_copy_button(text: str):
-    safe = html.escape(text)
-    components.html(
-        f"""
-        <div style="margin: 0.25rem 0 0.75rem 0;">
-          <button id="copyBtn"
-            style="width:100%;padding:12px;font-size:16px;
-                   background:#ff4b4b;color:white;border:none;
-                   border-radius:10px;cursor:pointer;">
-            📎 分析結果をコピー
-          </button>
-        </div>
-        <textarea id="copySrc" style="position:absolute;left:-9999px;top:-9999px;">{safe}</textarea>
-        <script>
-          document.getElementById("copyBtn").onclick = async () => {{
-            try {{
-              const ta = document.getElementById("copySrc");
-              const decoded = ta.value
-                .replaceAll("&amp;", "&")
-                .replaceAll("&lt;", "<")
-                .replaceAll("&gt;", ">")
-                .replaceAll("&quot;", '"')
-                .replaceAll("&#x27;", "'");
-              await navigator.clipboard.writeText(decoded);
-              alert("コピーしました");
-            }} catch(e) {{
-              alert("コピーに失敗しました（端末/ブラウザ制限の可能性）");
-            }}
-          }};
-        </script>
-        """,
-        height=90
-    )
 
 # ==================================================
 # 実行：逐次表示（終わったレースから順に出す）
@@ -180,12 +144,22 @@ if run:
 if "result_text" in st.session_state and st.session_state["result_text"]:
     meta = st.session_state.get("last_meta", {})
     title = f"📋 分析結果（{meta.get('place_name','')} {meta.get('year','')}年{meta.get('month','')}月{meta.get('day','')}日）"
+    
+    st.markdown("---")
     st.subheader(title)
 
-    _render_copy_button(st.session_state["result_text"])
+    # --------------------------------------------------
+    # 【変更点】st.code を使用して確実なコピーを実現
+    # --------------------------------------------------
+    st.info("右上のコピーボタンを押すと全文コピーできます 👇")
+    
+    # language="text" にすることでシンタックスハイライトなしの純粋なテキストとして表示
+    st.code(st.session_state["result_text"], language="text")
 
-    st.text_area(
-        "コピー用テキスト（ここから手動コピーも可）",
-        st.session_state["result_text"],
-        height=360
-    )
+    # 手動編集したいとき用にテキストエリアも残しておく（不要なら削除可）
+    with st.expander("手動で編集してからコピーしたい場合はこちら"):
+        st.text_area(
+            "編集用エリア",
+            st.session_state["result_text"],
+            height=360
+        )
