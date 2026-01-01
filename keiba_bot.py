@@ -566,11 +566,13 @@ def run_all_races(
                     continue
 
                 prompt = (
+                    f"{place_name}競馬場のレースのデータです。\n\n"
                     f"レース名: {race_meta.get('race_name','')}\n"
                     f"条件: {race_meta.get('cond','')}\n\n"
                     "以下の各馬のデータ（馬名、騎手、乗り替わり、調教師、談話、調教）です。\n"
                     + "\n".join(merged_text)
                 )
+
 
                 # --------------------------
                 # 3) Dify で分析
