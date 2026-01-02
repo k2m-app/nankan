@@ -1,3 +1,4 @@
+# keiba_bot.py
 import time
 import json
 import re
@@ -22,6 +23,10 @@ from urllib3.util.retry import Retry
 KEIBA_ID = st.secrets.get("KEIBA_ID", "")
 KEIBA_PASS = st.secrets.get("KEIBA_PASS", "")
 DIFY_API_KEY = st.secrets.get("DIFY_API_KEY", "")
+
+# self-host の場合はここを自分のDifyドメインに（例: https://dify.example.com）
+DIFY_BASE_URL = st.secrets.get("DIFY_BASE_URL", "https://api.dify.ai")
+
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
 
@@ -55,6 +60,30 @@ def _ui_markdown(ui: bool, msg: str):
 def _ui_divider(ui: bool):
     if ui:
         st.divider()
+
+# ==================================================
+# requests session + retry
+# ==================================================
+def _build_requests_session(total: int = 3, backoff: float = 0.6) -> requests.Session:
+    sess = requests.Session()
+    retry = Retry(
+        total=total,
+        connect=total,
+        read=total,
+        backoff_factor=backoff,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "POST"),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+# 使い回し（Dify）
+@st.cache_resource
+def get_http_session() -> requests.Session:
+    return _build_requests_session(total=3, backoff=0.6)
 
 # ==================================================
 # Supabase
@@ -149,7 +178,7 @@ def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code, ui
     return race_ids
 
 # ==================================================
-# 競馬ブック：レース情報/談話/調教（従来通り）
+# 競馬ブック：レース情報/談話/調教
 # ==================================================
 def parse_race_info(html: str):
     soup = BeautifulSoup(html, "html.parser")
@@ -221,7 +250,7 @@ def parse_cyokyo(html: str):
     return cyokyo_dict
 
 # ==================================================
-# 地方競馬公式（keiba.go.jp）：DOMで出馬表を「確実に」パース（差し替え版）
+# 地方競馬公式（keiba.go.jp）：DOMで出馬表を堅牢にパース
 # ==================================================
 _KEIBAGO_UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -232,38 +261,14 @@ _KEIBAGO_UA = {
 def _norm_name(s: str) -> str:
     s = (s or "").strip().replace("\u3000", " ")
     s = re.sub(r"\s+", " ", s)
-    # 減量記号を除去（比較用）
     s = s.replace("▲", "").replace("△", "").replace("☆", "").replace("◇", "")
     return s.strip()
 
-def _build_requests_session() -> requests.Session:
-    """
-    一時的な 5xx/429 や瞬断に強くするため Retry を入れる
-    """
-    sess = requests.Session()
-    retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=0.6,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET",),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    sess.mount("https://", adapter)
-    sess.mount("http://", adapter)
-    return sess
-
-_WEIGHT_RE = re.compile(r"^[☆▲△◇]?\s*\d{1,2}\.\d$")       # 55.0 / ☆ 53.0 等
+_WEIGHT_RE = re.compile(r"^[☆▲△◇]?\s*\d{1,2}\.\d$")  # 55.0 / ☆ 53.0 等
 _PREV_JOCKEY_RE = re.compile(r"\d+人\s+([☆▲△◇]?\s*\S+)\s+\d{1,2}\.\d")  # "5人 ▲高橋優 52.0" 等
 
 def _extract_jockey_from_cell(td) -> str:
-    """
-    負担重量・所属・成績が混ざるセルから騎手名だけ安定抽出
-    """
     lines = [x.strip() for x in td.get_text("\n", strip=True).split("\n") if x.strip()]
-    # 先頭の負担重量っぽい行を除去
     lines2 = [ln for ln in lines if not _WEIGHT_RE.match(ln)]
     if lines2:
         return lines2[0].replace(" ", "")
@@ -272,12 +277,6 @@ def _extract_jockey_from_cell(td) -> str:
 def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int, baba_code: str):
     """
     keiba.go.jp DebaTableSmall を堅牢に読む版（rowspan/列ズレ耐性あり）
-
-    ポイント：
-    - 「font.bamei」がある行＝馬行 として確実に拾う（ヘッダ行などを除外）
-    - rowspan で枠セルが欠ける行（同枠の2頭目など）は、直前枠 last_waku を継承
-    - 列位置を固定せず、「枠セルあり/なし」でオフセットを切り替える
-    - requests Retry で瞬間的な 5xx/429 に耐える
     """
     date_str = f"{year}/{str(month).zfill(2)}/{str(day).zfill(2)}"
     url = (
@@ -285,31 +284,28 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
         f"?k_raceDate={requests.utils.quote(date_str)}&k_raceNo={race_no}&k_babaCode={baba_code}"
     )
 
-    sess = _build_requests_session()
+    sess = _build_requests_session(total=3, backoff=0.6)
     r = sess.get(url, headers=_KEIBAGO_UA, timeout=25)
     r.raise_for_status()
     r.encoding = r.apparent_encoding or "utf-8"
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # ヘッダ（任意）
     header = ""
     top_bs = soup.select_one("table.bs")
     if top_bs:
         header = top_bs.get_text(" ", strip=True)
 
-    # 出馬表テーブル本体
     main_table = soup.select_one("td.dbtbl table.bs[border='1']")
     if not main_table:
         main_table = soup.select_one("table.bs[border='1']")
 
     horses = {}
-    last_waku = ""  # rowspan 欠け行の枠継承用
+    last_waku = ""
 
     if not main_table:
         return header, horses, url
 
     for tr in main_table.find_all("tr"):
-        # 馬行判定：馬名が入る font.bamei がある行だけ
         if not tr.select_one("font.bamei"):
             continue
 
@@ -317,7 +313,6 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
         if len(tds) < 8:
             continue
 
-        # 枠セルあり/なし判定（rowspan の2頭目は枠セルが無い）
         first_txt = tds[0].get_text(strip=True)
         waku_present = first_txt.isdigit() and len(tds) >= 9
         if waku_present:
@@ -344,18 +339,14 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
         if not umaban.isdigit():
             continue
 
-        # 馬名
         bamei_tag = horse_td.select_one("font.bamei b")
         horse = bamei_tag.get_text(strip=True) if bamei_tag else horse_td.get_text(" ", strip=True)
 
-        # 調教師（所属括弧は落とす）
         trainer_raw = trainer_td.get_text(" ", strip=True)
         trainer = trainer_raw.split("（")[0].strip() if trainer_raw else "不明"
 
-        # 騎手
         jockey = _extract_jockey_from_cell(jockey_td)
 
-        # 前走騎手（前走欄から抽出）
         prev_jockey = ""
         if zenso_td:
             zenso_txt = zenso_td.get_text(" ", strip=True)
@@ -380,13 +371,32 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
     return header, horses, url
 
 # ==================================================
-# Dify（streaming）
+# Dify：堅牢版（streaming + blockingフォールバック）
 # ==================================================
+def _dify_url(path: str) -> str:
+    base = (DIFY_BASE_URL or "").strip().rstrip("/")
+    return f"{base}{path}"
+
+def _format_http_error(res: requests.Response) -> str:
+    try:
+        j = res.json()
+        return f"⚠️ Dify HTTP {res.status_code}: {j}"
+    except:
+        txt = (res.text or "")[:800]
+        return f"⚠️ Dify HTTP {res.status_code}: {txt}"
+
 def stream_dify_workflow(full_text: str):
+    """
+    1) まず streaming で取りに行く
+    2) HTTPエラーは必ずyieldして終了（無反応化しない）
+    3) SSE取りこぼしを防ぐ（data:{}/data: {} 両対応）
+    4) workflow_finished/node_finished から outputs を回収
+    """
     if not DIFY_API_KEY:
         yield "⚠️ DIFY_API_KEY未設定"
         return
 
+    url = _dify_url("/v1/workflows/run")
     payload = {
         "inputs": {"text": full_text},
         "response_mode": "streaming",
@@ -395,47 +405,141 @@ def stream_dify_workflow(full_text: str):
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
         "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "Cache-Control": "no-cache",
     }
 
-    try:
-        res = requests.post(
-            "https://api.dify.ai/v1/workflows/run",
-            headers=headers,
-            json=payload,
-            stream=True,
-            timeout=300,
-        )
+    sess = get_http_session()
 
-        for line in res.iter_lines():
+    try:
+        res = sess.post(url, headers=headers, json=payload, stream=True, timeout=300)
+
+        # ★重要：HTTPエラーをここで潰す（無反応の最大原因）
+        if res.status_code != 200:
+            yield _format_http_error(res)
+            return
+
+        got_any = False
+
+        for line in res.iter_lines(decode_unicode=True):
             if not line:
                 continue
-            decoded = line.decode("utf-8", errors="ignore")
-            if not decoded.startswith("data:"):
+
+            if not line.startswith("data:"):
                 continue
 
-            raw = decoded.replace("data: ", "").strip()
+            raw = line[5:].lstrip()  # "data:" の後ろ（空白あり/なし両対応）
             if not raw:
                 continue
 
             try:
-                data = json.loads(raw)
+                evt = json.loads(raw)
             except:
                 continue
 
-            if "answer" in data and isinstance(data["answer"], str):
-                yield data["answer"]
+            got_any = True
 
-            if data.get("event") == "workflow_finished":
-                out = data.get("data", {}).get("outputs", {})
-                texts = [v for v in out.values() if isinstance(v, str)]
+            # 途中メッセージ/トークン（来る場合）
+            if "answer" in evt and isinstance(evt["answer"], str) and evt["answer"]:
+                yield evt["answer"]
+                continue
+
+            ev = evt.get("event")
+
+            # node_finished の outputs を拾う（フロー構成によってはここが主）
+            if ev == "node_finished":
+                data = evt.get("data", {}) or {}
+                outputs = data.get("outputs", {}) or {}
+                texts = [v for v in outputs.values() if isinstance(v, str) and v.strip()]
                 if texts:
                     yield "".join(texts)
+                continue
+
+            # 最終
+            if ev == "workflow_finished":
+                data = evt.get("data", {}) or {}
+                outputs = data.get("outputs", {}) or {}
+                texts = [v for v in outputs.values() if isinstance(v, str) and v.strip()]
+                if texts:
+                    yield "".join(texts)
+                else:
+                    err = data.get("error")
+                    status = data.get("status")
+                    if err:
+                        yield f"⚠️ workflow_finished error: {err}"
+                    else:
+                        yield f"⚠️ workflow_finished (status={status}) outputsが空でした"
+                return
+
+        if not got_any:
+            yield "⚠️ DifyがSSEを返しませんでした（URL/キー/アプリ種別/inputs名/ネットワークの可能性）"
 
     except Exception as e:
-        yield f"⚠️ API Error: {str(e)}"
+        yield f"⚠️ Dify API Error: {str(e)}"
+
+def run_dify_workflow_blocking(full_text: str) -> str:
+    """streamingがダメな時の最終手段（結果だけ欲しいならこれが一番安定）"""
+    if not DIFY_API_KEY:
+        return "⚠️ DIFY_API_KEY未設定"
+
+    url = _dify_url("/v1/workflows/run")
+    payload = {
+        "inputs": {"text": full_text},
+        "response_mode": "blocking",
+        "user": "keiba-bot",
+    }
+    headers = {
+        "Authorization": f"Bearer {DIFY_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    sess = get_http_session()
+
+    try:
+        res = sess.post(url, headers=headers, json=payload, timeout=300)
+        if res.status_code != 200:
+            return _format_http_error(res)
+
+        j = res.json() or {}
+        data = j.get("data", {}) or {}
+        outputs = data.get("outputs", {}) or {}
+
+        texts = [v for v in outputs.values() if isinstance(v, str) and v.strip()]
+        if texts:
+            return "".join(texts)
+
+        err = data.get("error")
+        if err:
+            return f"⚠️ blocking error: {err}"
+
+        return "⚠️ blockingで outputs が空でした"
+
+    except Exception as e:
+        return f"⚠️ blocking API Error: {str(e)}"
+
+def run_dify_with_fallback(full_text: str) -> str:
+    """
+    streaming で回収 → 何も得られない/エラーっぽい時は blocking に自動フォールバック
+    """
+    chunks = []
+    for c in stream_dify_workflow(full_text):
+        chunks.append(c)
+        # streamingエラー文が来たら即終了→blockingへ
+        if isinstance(c, str) and c.startswith("⚠️ Dify HTTP"):
+            break
+        if isinstance(c, str) and c.startswith("⚠️ Dify API Error"):
+            break
+
+    streamed = "".join(chunks).strip()
+
+    # streamed が空、もしくは「SSE返らない」系だったら blocking へ
+    if (not streamed) or ("SSEを返しません" in streamed) or (streamed.startswith("⚠️ Dify HTTP")):
+        return (run_dify_workflow_blocking(full_text) or "").strip() or "⚠️ Dify出力が空でした"
+
+    return streamed
 
 # ==================================================
-# メイン：全レース実行（★ここが重要：文字列を return）
+# メイン：全レース実行（文字列を return）
 # ==================================================
 def run_all_races(
     year: str,
@@ -447,10 +551,10 @@ def run_all_races(
 ) -> str:
     """
     place_code：競馬ブック側（10大井/11川崎/12船橋/13浦和）
-    騎手・調教師は keiba.go.jp の babaCode を使う
+    keiba.go.jp の babaCode は内部でマップ
 
-    ui=False（デフォルト）: 画面描画せず、結果文字列だけ返す（app.py向け）
-    ui=True              : 従来通り st.* で進捗を出す（単体実行向け）
+    ui=False: 画面描画せず結果文字列だけ返す
+    ui=True : 進捗を st.* で表示
     """
     place_names = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
     place_name = place_names.get(place_code, "地方")
@@ -485,181 +589,6 @@ def run_all_races(
             _ui_caption(ui, f"race_id(keibabook): {race_id}")
 
             try:
-                # --------------------------
-                # 0) keiba.go.jp 出馬表（騎手・調教師・前走騎手）
-                # --------------------------
-                header, keibago_dict, keibago_url = fetch_keibago_debatable_small(
-                    year=str(year),
-                    month=str(month),
-                    day=str(day),
-                    race_no=race_num,
-                    baba_code=str(baba_code),
-                )
-                _ui_caption(ui, f"keiba.go.jp: {keibago_url}")
-                if header:
-                    _ui_caption(ui, f"keiba.go.jp header: {header}")
-
-                if not keibago_dict:
-                    _ui_warning(ui, "⚠️ keiba.go.jp から出馬表が取れませんでした（続行しますが騎手/調教師が不明になります）")
-
-                # --------------------------
-                # 1) 談話（競馬ブック）
-                # --------------------------
-                _ui_info(ui, "📡 データ収集中...（談話）")
-                driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{race_id}")
-                try:
-                    wait.until(EC.presence_of_element_located((By.CLASS_NAME, "danwa")))
-                except:
-                    pass
-
-                html_danwa = driver.page_source
-                race_meta = parse_race_info(html_danwa)
-                danwa_dict = parse_danwa_comments(html_danwa)
-
-                # --------------------------
-                # 2) 調教（競馬ブック）
-                # --------------------------
-                _ui_info(ui, "📡 データ収集中...（調教）")
-                driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{race_id}")
-                try:
-                    wait.until(EC.presence_of_element_located((By.CLASS_NAME, "cyokyo")))
-                except:
-                    pass
-
-                cyokyo_dict = parse_cyokyo(driver.page_source)
-
-                # --------------------------
-                # 統合（馬番で揃える）
-                # --------------------------
-                all_uma = sorted(
-                    set(danwa_dict.keys()) | set(cyokyo_dict.keys()) | set(keibago_dict.keys()),
-                    key=lambda x: int(x) if str(x).isdigit() else 999,
-                )
-
-                merged_text = []
-                for uma in all_uma:
-                    kg = keibago_dict.get(uma, {})
-                    horse = kg.get("horse", "")
-                    jockey = kg.get("jockey", "不明")
-                    trainer = kg.get("trainer", "不明")
-                    prev_jockey = kg.get("prev_jockey", "")
-                    is_change = kg.get("is_change", False)
-
-                    alert = "【⚠️乗り替わり】" if is_change else ""
-                    if prev_jockey:
-                        alert += f"（前走:{prev_jockey}）"
-
-                    d = danwa_dict.get(uma, "（なし）")
-                    c = cyokyo_dict.get(uma, "（なし）")
-
-                    merged_text.append(
-                        f"▼[馬番{uma}] 馬名:{horse} 騎手:{jockey} {alert} 調教師:{trainer}\n"
-                        f"談話: {d}\n"
-                        f"調教: {c}"
-                    )
-
-                if not merged_text:
-                    block = f"【{place_name} {race_num}R】\n⚠️ データなしのためスキップ"
-                    result_blocks.append(block)
-                    _ui_warning(ui, "データなしのためスキップ")
-                    _ui_divider(ui)
-                    continue
-
-                prompt = (
-                    f"{place_name}競馬場のレースのデータです。\n\n"
-                    f"レース名: {race_meta.get('race_name','')}\n"
-                    f"条件: {race_meta.get('cond','')}\n\n"
-                    "以下の各馬のデータ（馬名、騎手、乗り替わり、調教師、談話、調教）です。\n"
-                    + "\n".join(merged_text)
-                )
-
-
-                # --------------------------
-                # 3) Dify で分析
-                # --------------------------
-                _ui_info(ui, "🤖 AI分析中...")
-                full_ans = ""
-
-                if ui:
-                    result_area = st.empty()
-                    for chunk in stream_dify_workflow(prompt):
-                        full_ans += chunk
-                        result_area.markdown(full_ans + "▌")
-                    result_area.markdown(full_ans)
-                else:
-                    for chunk in stream_dify_workflow(prompt):
-                        full_ans += chunk
-
-                full_ans = (full_ans or "").strip()
-                if full_ans == "":
-                    full_ans = "⚠️ AIの出力が空でした（Dify応答なし/エラーの可能性）"
-
-                _ui_success(ui, "✅ 完了")
-
-                save_history(year, place_code, place_name, month, day, race_num_str, race_id, full_ans)
-
-                block = f"【{place_name} {race_num}R】\n{full_ans}"
-                result_blocks.append(block)
-
-            except Exception as e:
-                msg = f"【{place_name} {race_num}R】\n⚠️ Error: {e}"
-                result_blocks.append(msg)
-                _ui_error(ui, f"Error: {e}")
-
-            _ui_divider(ui)
-
-    finally:
-        try:
-            driver.quit()
-        except:
-            pass
-
-    return "\n\n".join(result_blocks).strip()
-
-def run_races_iter(
-    year: str,
-    month: str,
-    day: str,
-    place_code: str,
-    target_races: set[int] | None,
-    ui: bool = False,
-):
-    """
-    1レース処理が完了するたびに (race_num:int, block_text:str) を yield する。
-    app.py 側で逐次表示する用途。
-    """
-    place_names = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
-    place_name = place_names.get(place_code, "地方")
-
-    baba_map = {"10": "20", "11": "21", "12": "19", "13": "18"}
-    baba_code = baba_map.get(place_code)
-    if not baba_code:
-        yield (0, "⚠️ babaCode mapping が未定義です。place_code を確認してください。")
-        return
-
-    driver = build_driver()
-    wait = WebDriverWait(driver, 12)
-
-    try:
-        _ui_info(ui, "🔑 ログイン中...（競馬ブック）")
-        login_keibabook(driver, wait)
-
-        race_ids = fetch_race_ids_from_schedule(driver, year, month, day, place_code, ui=ui)
-        if not race_ids:
-            yield (0, "⚠️ レースIDが取得できませんでした。日付/競馬場コードを確認してください。")
-            return
-
-        for i, race_id in enumerate(race_ids):
-            race_num = i + 1
-            if target_races is not None and race_num not in target_races:
-                continue
-
-            race_num_str = f"{race_num:02}"
-
-            _ui_markdown(ui, f"## {place_name} {race_num}R")
-            _ui_caption(ui, f"race_id(keibabook): {race_id}")
-
-            try:
                 # 0) keiba.go.jp 出馬表
                 header, keibago_dict, keibago_url = fetch_keibago_debatable_small(
                     year=str(year),
@@ -673,7 +602,7 @@ def run_races_iter(
                     _ui_caption(ui, f"keiba.go.jp header: {header}")
 
                 if not keibago_dict:
-                    _ui_warning(ui, "⚠️ keiba.go.jp から出馬表が取れませんでした（続行しますが騎手/調教師が不明になります）")
+                    _ui_warning(ui, "⚠️ keiba.go.jp から出馬表が取れませんでした（続行：騎手/調教師が不明になります）")
 
                 # 1) 談話
                 _ui_info(ui, "📡 データ収集中...（談話）")
@@ -727,6 +656,184 @@ def run_races_iter(
 
                 if not merged_text:
                     block = f"【{place_name} {race_num}R】\n⚠️ データなしのためスキップ"
+                    result_blocks.append(block)
+                    _ui_warning(ui, "データなしのためスキップ")
+                    _ui_divider(ui)
+                    continue
+
+                prompt = (
+                    f"{place_name}競馬場のレースのデータです。\n\n"
+                    f"レース名: {race_meta.get('race_name','')}\n"
+                    f"条件: {race_meta.get('cond','')}\n\n"
+                    "以下の各馬のデータ（馬名、騎手、乗り替わり、調教師、談話、調教）です。\n"
+                    + "\n".join(merged_text)
+                )
+
+                # 3) Dify（★ここを “確実に” 反応する形に）
+                _ui_info(ui, "🤖 AI分析中...（Dify）")
+                full_ans = ""
+
+                if ui:
+                    # UI表示しながら（streaming）→ 反応なければ自動でblockingに切り替える
+                    result_area = st.empty()
+
+                    # まず streaming を試す（表示あり）
+                    chunks = []
+                    for chunk in stream_dify_workflow(prompt):
+                        chunks.append(chunk)
+                        tmp = "".join(chunks)
+                        result_area.markdown(tmp + "▌")
+
+                        # 明確なHTTPエラーなら止めてblockingへ
+                        if chunk.startswith("⚠️ Dify HTTP") or chunk.startswith("⚠️ Dify API Error"):
+                            break
+
+                    streamed = "".join(chunks).strip()
+
+                    # ダメならblockingへ
+                    if (not streamed) or ("SSEを返しません" in streamed) or streamed.startswith("⚠️ Dify HTTP"):
+                        streamed = run_dify_workflow_blocking(prompt)
+
+                    full_ans = (streamed or "").strip()
+                    result_area.markdown(full_ans if full_ans else "⚠️ AIの出力が空でした")
+
+                else:
+                    # UIなし：最初からフォールバック込みの安定関数
+                    full_ans = run_dify_with_fallback(prompt)
+
+                full_ans = (full_ans or "").strip()
+                if full_ans == "":
+                    full_ans = "⚠️ AIの出力が空でした（Dify応答なし/エラーの可能性）"
+
+                _ui_success(ui, "✅ 完了")
+
+                save_history(year, place_code, place_name, month, day, race_num_str, race_id, full_ans)
+
+                block = f"【{place_name} {race_num}R】\n{full_ans}"
+                result_blocks.append(block)
+
+            except Exception as e:
+                msg = f"【{place_name} {race_num}R】\n⚠️ Error: {e}"
+                result_blocks.append(msg)
+                _ui_error(ui, f"Error: {e}")
+
+            _ui_divider(ui)
+
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
+
+    return "\n\n".join(result_blocks).strip()
+
+def run_races_iter(
+    year: str,
+    month: str,
+    day: str,
+    place_code: str,
+    target_races: set[int] | None,
+    ui: bool = False,
+):
+    """
+    1レース処理が完了するたびに (race_num:int, block_text:str) を yield
+    app.py 側で逐次表示する用途
+    """
+    place_names = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
+    place_name = place_names.get(place_code, "地方")
+
+    baba_map = {"10": "20", "11": "21", "12": "19", "13": "18"}
+    baba_code = baba_map.get(place_code)
+    if not baba_code:
+        yield (0, "⚠️ babaCode mapping が未定義です。place_code を確認してください。")
+        return
+
+    driver = build_driver()
+    wait = WebDriverWait(driver, 12)
+
+    try:
+        _ui_info(ui, "🔑 ログイン中...（競馬ブック）")
+        login_keibabook(driver, wait)
+
+        race_ids = fetch_race_ids_from_schedule(driver, year, month, day, place_code, ui=ui)
+        if not race_ids:
+            yield (0, "⚠️ レースIDが取得できませんでした。日付/競馬場コードを確認してください。")
+            return
+
+        for i, race_id in enumerate(race_ids):
+            race_num = i + 1
+            if target_races is not None and race_num not in target_races:
+                continue
+
+            race_num_str = f"{race_num:02}"
+
+            _ui_markdown(ui, f"## {place_name} {race_num}R")
+            _ui_caption(ui, f"race_id(keibabook): {race_id}")
+
+            try:
+                header, keibago_dict, keibago_url = fetch_keibago_debatable_small(
+                    year=str(year),
+                    month=str(month),
+                    day=str(day),
+                    race_no=race_num,
+                    baba_code=str(baba_code),
+                )
+                _ui_caption(ui, f"keiba.go.jp: {keibago_url}")
+                if header:
+                    _ui_caption(ui, f"keiba.go.jp header: {header}")
+
+                if not keibago_dict:
+                    _ui_warning(ui, "⚠️ keiba.go.jp から出馬表が取れませんでした（続行：騎手/調教師が不明になります）")
+
+                _ui_info(ui, "📡 データ収集中...（談話）")
+                driver.get(f"https://s.keibabook.co.jp/chihou/danwa/1/{race_id}")
+                try:
+                    wait.until(EC.presence_of_element_located((By.CLASS_NAME, "danwa")))
+                except:
+                    pass
+
+                html_danwa = driver.page_source
+                race_meta = parse_race_info(html_danwa)
+                danwa_dict = parse_danwa_comments(html_danwa)
+
+                _ui_info(ui, "📡 データ収集中...（調教）")
+                driver.get(f"https://s.keibabook.co.jp/chihou/cyokyo/1/{race_id}")
+                try:
+                    wait.until(EC.presence_of_element_located((By.CLASS_NAME, "cyokyo")))
+                except:
+                    pass
+
+                cyokyo_dict = parse_cyokyo(driver.page_source)
+
+                all_uma = sorted(
+                    set(danwa_dict.keys()) | set(cyokyo_dict.keys()) | set(keibago_dict.keys()),
+                    key=lambda x: int(x) if str(x).isdigit() else 999,
+                )
+
+                merged_text = []
+                for uma in all_uma:
+                    kg = keibago_dict.get(uma, {})
+                    horse = kg.get("horse", "")
+                    jockey = kg.get("jockey", "不明")
+                    trainer = kg.get("trainer", "不明")
+                    prev_jockey = kg.get("prev_jockey", "")
+                    is_change = kg.get("is_change", False)
+
+                    alert = "【⚠️乗り替わり】" if is_change else ""
+                    if prev_jockey:
+                        alert += f"（前走:{prev_jockey}）"
+
+                    d = danwa_dict.get(uma, "（なし）")
+                    c = cyokyo_dict.get(uma, "（なし）")
+
+                    merged_text.append(
+                        f"▼[馬番{uma}] 馬名:{horse} 騎手:{jockey} {alert} 調教師:{trainer}\n"
+                        f"談話: {d}\n"
+                        f"調教: {c}"
+                    )
+
+                if not merged_text:
+                    block = f"【{place_name} {race_num}R】\n⚠️ データなしのためスキップ"
                     yield (race_num, block)
                     _ui_warning(ui, "データなしのためスキップ")
                     _ui_divider(ui)
@@ -739,11 +846,8 @@ def run_races_iter(
                     + "\n".join(merged_text)
                 )
 
-                # 3) Dify
-                _ui_info(ui, "🤖 AI分析中...")
-                full_ans = ""
-                for chunk in stream_dify_workflow(prompt):
-                    full_ans += chunk
+                _ui_info(ui, "🤖 AI分析中...（Dify）")
+                full_ans = run_dify_with_fallback(prompt)
 
                 full_ans = (full_ans or "").strip()
                 if full_ans == "":
