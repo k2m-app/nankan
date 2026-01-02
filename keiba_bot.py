@@ -264,8 +264,8 @@ def _norm_name(s: str) -> str:
     s = s.replace("▲", "").replace("△", "").replace("☆", "").replace("◇", "")
     return s.strip()
 
-_WEIGHT_RE = re.compile(r"^[☆▲△◇]?\s*\d{1,2}\.\d$")  # 55.0 / ☆ 53.0 等
-_PREV_JOCKEY_RE = re.compile(r"\d+人\s+([☆▲△◇]?\s*\S+)\s+\d{1,2}\.\d")  # "5人 ▲高橋優 52.0" 等
+_WEIGHT_RE = re.compile(r"^[☆▲△◇]?\s*\d{1,2}\.\d$")
+_PREV_JOCKEY_RE = re.compile(r"\d+人\s+([☆▲△◇]?\s*\S+)\s+\d{1,2}\.\d")
 
 def _extract_jockey_from_cell(td) -> str:
     lines = [x.strip() for x in td.get_text("\n", strip=True).split("\n") if x.strip()]
@@ -385,12 +385,37 @@ def _format_http_error(res: requests.Response) -> str:
         txt = (res.text or "")[:800]
         return f"⚠️ Dify HTTP {res.status_code}: {txt}"
 
+def _pick_output(outputs: dict) -> str:
+    """
+    outputs から「最終回答っぽい」1つだけを安全に拾う。
+    node_finished の queries 等を誤爆で拾わないため、候補キー優先。
+    """
+    if not isinstance(outputs, dict):
+        return ""
+    # よくあるキー候補（ワークフロー側の Output 名に合わせて増やしてOK）
+    candidates = ["answer", "final", "result", "output", "text", "content"]
+    for k in candidates:
+        v = outputs.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # 候補キーが無い場合：最後の手段として「それっぽい長文」だけ拾う
+    # （queries など短いノイズを避けるため、文字数の大きいものを選ぶ）
+    best = ""
+    best_len = 0
+    for v in outputs.values():
+        if isinstance(v, str):
+            s = v.strip()
+            if len(s) > best_len:
+                best = s
+                best_len = len(s)
+    return best.strip()
+
 def stream_dify_workflow(full_text: str):
     """
-    1) まず streaming で取りに行く
-    2) HTTPエラーは必ずyieldして終了（無反応化しない）
-    3) SSE取りこぼしを防ぐ（data:{}/data: {} 両対応）
-    4) workflow_finished/node_finished から outputs を回収
+    streaming のイベントから「回答テキストのみ」を返す。
+    ★重要：node_finished の outputs（queries/STOP等）が混ざるので基本拾わない
+    ★workflow_finished は、answer増分が1文字も来なかった時の保険としてのみ採用
     """
     if not DIFY_API_KEY:
         yield "⚠️ DIFY_API_KEY未設定"
@@ -413,22 +438,23 @@ def stream_dify_workflow(full_text: str):
 
     try:
         res = sess.post(url, headers=headers, json=payload, stream=True, timeout=300)
-
-        # ★重要：HTTPエラーをここで潰す（無反応の最大原因）
         if res.status_code != 200:
             yield _format_http_error(res)
             return
 
-        got_any = False
+        got_any_event = False
+        got_any_answer = False
+        final_from_outputs = ""
 
         for line in res.iter_lines(decode_unicode=True):
             if not line:
                 continue
 
+            # SSE: "data: {...}"
             if not line.startswith("data:"):
                 continue
 
-            raw = line[5:].lstrip()  # "data:" の後ろ（空白あり/なし両対応）
+            raw = line[5:].lstrip()
             if not raw:
                 continue
 
@@ -437,48 +463,36 @@ def stream_dify_workflow(full_text: str):
             except:
                 continue
 
-            got_any = True
+            got_any_event = True
 
-            # 途中メッセージ/トークン（来る場合）
+            # ✅ 1) まず answer 増分だけを拾う（これが最優先）
             if "answer" in evt and isinstance(evt["answer"], str) and evt["answer"]:
+                got_any_answer = True
                 yield evt["answer"]
                 continue
 
             ev = evt.get("event")
-
-            # node_finished の outputs を拾う（フロー構成によってはここが主）
-            if ev == "node_finished":
-                data = evt.get("data", {}) or {}
-                outputs = data.get("outputs", {}) or {}
-                texts = [v for v in outputs.values() if isinstance(v, str) and v.strip()]
-                if texts:
-                    yield "".join(texts)
-                continue
-
-            # 最終
             if ev == "workflow_finished":
                 data = evt.get("data", {}) or {}
                 outputs = data.get("outputs", {}) or {}
-                texts = [v for v in outputs.values() if isinstance(v, str) and v.strip()]
-                if texts:
-                    yield "".join(texts)
+                final_from_outputs = _pick_output(outputs)
+
+                # answer増分が1文字も来なかった場合のみ、outputsを返す
+                if (not got_any_answer) and final_from_outputs:
+                    yield final_from_outputs
                 else:
-                    err = data.get("error")
-                    status = data.get("status")
-                    if err:
-                        yield f"⚠️ workflow_finished error: {err}"
-                    else:
-                        yield f"⚠️ workflow_finished (status={status}) outputsが空でした"
+                    # 既に answer を返している場合は重複を避けて何も返さない
+                    pass
                 return
 
-        if not got_any:
+        if not got_any_event:
             yield "⚠️ DifyがSSEを返しませんでした（URL/キー/アプリ種別/inputs名/ネットワークの可能性）"
 
     except Exception as e:
         yield f"⚠️ Dify API Error: {str(e)}"
 
 def run_dify_workflow_blocking(full_text: str) -> str:
-    """streamingがダメな時の最終手段（結果だけ欲しいならこれが一番安定）"""
+    """結果だけ欲しいならこれが一番安定"""
     if not DIFY_API_KEY:
         return "⚠️ DIFY_API_KEY未設定"
 
@@ -504,9 +518,9 @@ def run_dify_workflow_blocking(full_text: str) -> str:
         data = j.get("data", {}) or {}
         outputs = data.get("outputs", {}) or {}
 
-        texts = [v for v in outputs.values() if isinstance(v, str) and v.strip()]
-        if texts:
-            return "".join(texts)
+        picked = _pick_output(outputs)
+        if picked:
+            return picked
 
         err = data.get("error")
         if err:
@@ -519,21 +533,20 @@ def run_dify_workflow_blocking(full_text: str) -> str:
 
 def run_dify_with_fallback(full_text: str) -> str:
     """
-    streaming で回収 → 何も得られない/エラーっぽい時は blocking に自動フォールバック
+    streaming で回収 → 何も得られない/エラーっぽい時は blocking にフォールバック
     """
     chunks = []
+    got_error = False
+
     for c in stream_dify_workflow(full_text):
         chunks.append(c)
-        # streamingエラー文が来たら即終了→blockingへ
-        if isinstance(c, str) and c.startswith("⚠️ Dify HTTP"):
-            break
-        if isinstance(c, str) and c.startswith("⚠️ Dify API Error"):
+        if isinstance(c, str) and (c.startswith("⚠️ Dify HTTP") or c.startswith("⚠️ Dify API Error")):
+            got_error = True
             break
 
     streamed = "".join(chunks).strip()
 
-    # streamed が空、もしくは「SSE返らない」系だったら blocking へ
-    if (not streamed) or ("SSEを返しません" in streamed) or (streamed.startswith("⚠️ Dify HTTP")):
+    if (not streamed) or ("SSEを返しません" in streamed) or got_error:
         return (run_dify_workflow_blocking(full_text) or "").strip() or "⚠️ Dify出力が空でした"
 
     return streamed
@@ -669,36 +682,32 @@ def run_all_races(
                     + "\n".join(merged_text)
                 )
 
-                # 3) Dify（★ここを “確実に” 反応する形に）
+                # 3) Dify
                 _ui_info(ui, "🤖 AI分析中...（Dify）")
-                full_ans = ""
 
                 if ui:
-                    # UI表示しながら（streaming）→ 反応なければ自動でblockingに切り替える
+                    # ✅ UI時：streamingは「answer増分」だけを表示する（node_finished等は拾わない実装になってる）
                     result_area = st.empty()
+                    answer_buf = ""
 
-                    # まず streaming を試す（表示あり）
-                    chunks = []
+                    got_error = False
                     for chunk in stream_dify_workflow(prompt):
-                        chunks.append(chunk)
-                        tmp = "".join(chunks)
-                        result_area.markdown(tmp + "▌")
-
-                        # 明確なHTTPエラーなら止めてblockingへ
-                        if chunk.startswith("⚠️ Dify HTTP") or chunk.startswith("⚠️ Dify API Error"):
+                        if isinstance(chunk, str) and (chunk.startswith("⚠️ Dify HTTP") or chunk.startswith("⚠️ Dify API Error")):
+                            got_error = True
+                            answer_buf = chunk
+                            result_area.markdown(answer_buf)
                             break
 
-                    streamed = "".join(chunks).strip()
+                        answer_buf += chunk
+                        result_area.markdown(answer_buf + "▌")
 
-                    # ダメならblockingへ
-                    if (not streamed) or ("SSEを返しません" in streamed) or streamed.startswith("⚠️ Dify HTTP"):
-                        streamed = run_dify_workflow_blocking(prompt)
+                    if (not answer_buf) or ("SSEを返しません" in answer_buf) or got_error:
+                        answer_buf = run_dify_workflow_blocking(prompt) or ""
 
-                    full_ans = (streamed or "").strip()
+                    full_ans = (answer_buf or "").strip()
                     result_area.markdown(full_ans if full_ans else "⚠️ AIの出力が空でした")
-
                 else:
-                    # UIなし：最初からフォールバック込みの安定関数
+                    # UIなし：最初からフォールバック込み
                     full_ans = run_dify_with_fallback(prompt)
 
                 full_ans = (full_ans or "").strip()
