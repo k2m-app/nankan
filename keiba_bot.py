@@ -80,7 +80,7 @@ def _build_requests_session(total: int = 3, backoff: float = 0.6) -> requests.Se
     sess.mount("http://", adapter)
     return sess
 
-# 使い回し（Dify用など）
+# 使い回し
 @st.cache_resource
 def get_http_session() -> requests.Session:
     return _build_requests_session(total=3, backoff=0.6)
@@ -139,9 +139,6 @@ def login_keibabook(driver: webdriver.Chrome, wait: WebDriverWait):
 # スクレイピング：日程→レースID一覧（競馬ブック）
 # ==================================================
 def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code, ui: bool = False):
-    """
-    日程ページから「指定競馬場コード」のレースID(16桁)を拾う（競馬ブック）
-    """
     date_str = f"{year}{month}{day}"
     url = f"https://s.keibabook.co.jp/chihou/nittei/{date_str}10"
 
@@ -163,8 +160,6 @@ def fetch_race_ids_from_schedule(driver, year, month, day, target_place_code, ui
         if not m:
             continue
         rid = m.group(1)
-
-        # rid[6:8] が競馬場コード（競馬ブック側）
         if rid[6:8] == target_place_code:
             if rid not in seen:
                 race_ids.append(rid)
@@ -275,9 +270,6 @@ def _extract_jockey_from_cell(td) -> str:
     return "不明"
 
 def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int, baba_code: str):
-    """
-    keiba.go.jp DebaTableSmall を堅牢に読む版（rowspan/列ズレ耐性あり）
-    """
     date_str = f"{year}/{str(month).zfill(2)}/{str(day).zfill(2)}"
     url = (
         "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTableSmall"
@@ -371,7 +363,7 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
     return header, horses, url
 
 # ==================================================
-# Dify：堅牢版（streaming + polling回収 + blockingフォールバック）
+# Dify：堅牢かつ余計なテキストを拾わない修正版
 # ==================================================
 def _dify_url(path: str) -> str:
     base = (DIFY_BASE_URL or "").strip().rstrip("/")
@@ -386,17 +378,21 @@ def _format_http_error(res: requests.Response) -> str:
         return f"⚠️ Dify HTTP {res.status_code}: {txt}"
 
 def _pick_output(outputs: dict) -> str:
-    """outputs辞書から有力なテキストを探して返す"""
+    """outputs辞書から最終回答と思われるテキストだけを探す"""
     if not isinstance(outputs, dict):
         return ""
-    # 一般的なキー（ワークフローの設定によるがこれらを網羅すれば概ねOK）
-    candidates = ["answer", "final", "result", "output", "text", "content"]
+    # 優先順位：result, output, answer, text
+    # 以前のコードでは入力を拾ってしまっていたため、キーを絞る
+    candidates = ["result", "answer", "output", "text"]
     for k in candidates:
         v = outputs.get(k)
         if isinstance(v, str) and v.strip():
+            # 入力プロンプトそのものが返ってきている場合(Difyのバグ等)の対策は難しいが、
+            # 通常 output キーに入っているものが正解
             return v.strip()
     
-    # キーが見つからない場合、最も長い文字列を返す（ノイズ回避）
+    # キーが見つからない場合も、極端に長い（プロンプト丸ごとのような）ものは避ける等の工夫が可能だが
+    # ここではシンプルに「一番長い文字列」を返す（Difyの出力を信じる）
     best = ""
     best_len = 0
     for v in outputs.values():
@@ -408,7 +404,6 @@ def _pick_output(outputs: dict) -> str:
     return best.strip()
 
 def get_workflow_run_detail(workflow_run_id: str) -> dict:
-    """GET /workflows/run/{workflow_run_id}"""
     url = _dify_url(f"/v1/workflows/run/{workflow_run_id}")
     headers = {"Authorization": f"Bearer {DIFY_API_KEY}"}
     sess = get_http_session()
@@ -424,15 +419,13 @@ def poll_workflow_until_done(workflow_run_id: str, max_wait_sec: int = 120, inte
     while time.time() - start < max_wait_sec:
         try:
             j = get_workflow_run_detail(workflow_run_id) or {}
-        except Exception as e:
-            # ネットワークエラー等は少し待って再試行
+        except:
             time.sleep(interval_sec)
             continue
             
         status = j.get("status") or j.get("data", {}).get("status") or ""
         last_status = status
 
-        # docs例は直下/ data配下の両方があり得るので両対応
         outputs = j.get("outputs") or j.get("data", {}).get("outputs") or {}
         err = j.get("error") or j.get("data", {}).get("error")
 
@@ -446,40 +439,12 @@ def poll_workflow_until_done(workflow_run_id: str, max_wait_sec: int = 120, inte
 
     return f"⚠️ workflow polling timeout（last_status={last_status}）"
 
-def _extract_text_from_workflow_event(evt: dict) -> str:
-    """
-    /workflows/run streaming は answer が常に来るとは限らないため、
-    event/data 内の “テキストらしきもの” を広く拾う
-    """
-    if not isinstance(evt, dict):
-        return ""
-
-    # 1) まずは通常のanswer（来れば最優先）
-    v = evt.get("answer")
-    if isinstance(v, str) and v:
-        return v
-
-    data = evt.get("data") or {}
-    if isinstance(data, dict):
-        # よくある候補
-        for k in ("answer", "text", "content", "output", "result", "final"):
-            v2 = data.get(k)
-            if isinstance(v2, str) and v2:
-                return v2
-
-        # outputs で返ってくるタイプもある
-        outputs = data.get("outputs")
-        if isinstance(outputs, dict):
-            picked = _pick_output(outputs)
-            if picked:
-                return picked
-
-    return ""
-
 def stream_dify_workflow(full_text: str):
     """
-    streaming のイベントから “回答テキスト” を yield
-    途中で切れても workflow_run_id を拾って polling で回収できるようにする
+    【修正ポイント】
+    以前は event の種類を見ずに data 内のテキストを全て拾っていたため、
+    入力プロンプト(node_finished 等に含まれる)まで表示されていた。
+    今回は 'text_chunk' (生成テキスト) と 'workflow_finished' のみに限定する。
     """
     if not DIFY_API_KEY:
         yield "⚠️ DIFY_API_KEY未設定"
@@ -505,13 +470,11 @@ def stream_dify_workflow(full_text: str):
     got_any_event = False
 
     try:
-        # connect/read を分ける（LLMは生成が遅いのでread長めに）
         res = sess.post(url, headers=headers, json=payload, stream=True, timeout=(10, 310))
         if res.status_code != 200:
             yield _format_http_error(res)
             return
 
-        # バッファを減らしてリアルタイム性を上げる
         for line in res.iter_lines(decode_unicode=True, chunk_size=1):
             if not line:
                 continue
@@ -528,46 +491,56 @@ def stream_dify_workflow(full_text: str):
                 continue
 
             got_any_event = True
-
-            # workflow_run_id を可能な限り拾う（キー名の揺れも吸収）
+            
+            # run_id確保
             workflow_run_id = workflow_run_id or evt.get("workflow_run_id") or (evt.get("data", {}) or {}).get("workflow_run_id") or ""
 
-            # テキスト抽出
-            txt = _extract_text_from_workflow_event(evt)
-            if txt:
-                got_any_text = True
-                yield txt
+            # イベントタイプを確認
+            event_type = evt.get("event")
+            data = evt.get("data") or {}
 
-            # 終了イベント
-            ev = evt.get("event")
-            if ev == "workflow_finished":
-                # テキストが一切取れなかった場合は outputs を拾って返す
+            # ---------------------------------------------------------
+            # ここが重要な修正：特定のイベントだけを処理する
+            # ---------------------------------------------------------
+            
+            # 1. AI生成テキスト (Streaming)
+            if event_type == "text_chunk":
+                text = data.get("text", "")
+                if text:
+                    got_any_text = True
+                    yield text
+                continue
+
+            # 2. ワークフロー完了 (Final Output)
+            # ストリーミングされなかった場合や、最終的なまとめを受け取る
+            if event_type == "workflow_finished":
                 if not got_any_text:
-                    data = evt.get("data", {}) or {}
                     outputs = data.get("outputs", {}) or {}
                     final = _pick_output(outputs)
                     if final:
                         yield final
                 return
 
-        # ここまで来た=streamが途切れた or 無音終了
+            # 3. その他のイベント (node_started, node_finished, workflow_started, ping など)
+            # これらには入力データ(inputs)が含まれることがあり、表示するとノイズになるので無視する
+            continue
+
+        # ストリームが途切れた場合
         if not got_any_event:
-            yield "⚠️ DifyがSSEを返しませんでした（ネットワーク/設定/混雑の可能性）"
+            yield "⚠️ DifyがSSEを返しませんでした"
             return
 
-        # ★重要：streamが正常終了せず切れたが run_id があれば後追い回収
+        # 完了していないのにストリームが終わった場合はポーリングで回収
         if workflow_run_id:
             yield poll_workflow_until_done(workflow_run_id, max_wait_sec=140)
 
     except Exception as e:
-        # ★例外時も run_id が拾えていれば回収を試す
         if workflow_run_id:
             yield poll_workflow_until_done(workflow_run_id, max_wait_sec=140)
         else:
             yield f"⚠️ Dify API Error: {str(e)}"
 
 def run_dify_workflow_blocking(full_text: str) -> str:
-    """blocking は Cloudflare 100s制限等があるので注意"""
     if not DIFY_API_KEY:
         return "⚠️ DIFY_API_KEY未設定"
 
@@ -585,7 +558,6 @@ def run_dify_workflow_blocking(full_text: str) -> str:
     sess = get_http_session()
 
     try:
-        # タイムアウト設定
         res = sess.post(url, headers=headers, json=payload, timeout=(10, 95))
         if res.status_code != 200:
             return _format_http_error(res)
@@ -608,10 +580,6 @@ def run_dify_workflow_blocking(full_text: str) -> str:
         return f"⚠️ blocking API Error: {str(e)}"
 
 def run_dify_with_fallback(full_text: str) -> str:
-    """
-    streaming → 取れなければ blocking
-    （stream側で polling回収までやるので、ここはシンプルでOK）
-    """
     chunks = []
     got_error = False
 
@@ -623,7 +591,6 @@ def run_dify_with_fallback(full_text: str) -> str:
 
     streamed = "".join(chunks).strip()
     
-    # 失敗したっぽい場合はblockingを試す
     if (not streamed) or got_error:
         return (run_dify_workflow_blocking(full_text) or "").strip() or "⚠️ Dify出力が空でした"
         
@@ -640,10 +607,6 @@ def run_all_races(
     target_races: set[int] | None,
     ui: bool = False,
 ) -> str:
-    """
-    place_code：競馬ブック側（10大井/11川崎/12船橋/13浦和）
-    keiba.go.jp の babaCode は内部でマップ
-    """
     place_names = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
     place_name = place_names.get(place_code, "地方")
 
@@ -714,7 +677,7 @@ def run_all_races(
 
                 cyokyo_dict = parse_cyokyo(driver.page_source)
 
-                # 統合（馬番で揃える）
+                # 統合
                 all_uma = sorted(
                     set(danwa_dict.keys()) | set(cyokyo_dict.keys()) | set(keibago_dict.keys()),
                     key=lambda x: int(x) if str(x).isdigit() else 999,
@@ -761,12 +724,10 @@ def run_all_races(
                 _ui_info(ui, "🤖 AI分析中...（Dify）")
 
                 if ui:
-                    # ✅ UI時：streaming表示
                     result_area = st.empty()
                     answer_buf = ""
                     got_error = False
 
-                    # stream_dify_workflow は堅牢版（polling含む）
                     for chunk in stream_dify_workflow(prompt):
                         if isinstance(chunk, str) and (chunk.startswith("⚠️ Dify HTTP") or chunk.startswith("⚠️ Dify API Error")):
                             got_error = True
@@ -777,14 +738,12 @@ def run_all_races(
                         answer_buf += chunk
                         result_area.markdown(answer_buf + "▌")
 
-                    # エラーならfallbackも試す
                     if (not answer_buf) or got_error:
                          answer_buf = run_dify_workflow_blocking(prompt) or ""
 
                     full_ans = (answer_buf or "").strip()
                     result_area.markdown(full_ans if full_ans else "⚠️ AIの出力が空でした")
                 else:
-                    # UIなし
                     full_ans = run_dify_with_fallback(prompt)
 
                 full_ans = (full_ans or "").strip()
@@ -821,10 +780,6 @@ def run_races_iter(
     target_races: set[int] | None,
     ui: bool = False,
 ):
-    """
-    1レース処理が完了するたびに (race_num:int, block_text:str) を yield
-    app.py 側で逐次表示する用途
-    """
     place_names = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
     place_name = place_names.get(place_code, "地方")
 
