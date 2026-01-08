@@ -23,8 +23,7 @@ KEIBA_ID = st.secrets.get("KEIBA_ID", "")
 KEIBA_PASS = st.secrets.get("KEIBA_PASS", "")
 DIFY_API_KEY = st.secrets.get("DIFY_API_KEY", "")
 
-# self-host の場合はここを自分のDifyドメインに（例: https://dify.example.com）
-# クラウド版の場合は https://api.dify.ai
+# self-host の場合はここを自分のDifyドメインに
 DIFY_BASE_URL = st.secrets.get("DIFY_BASE_URL", "https://api.dify.ai")
 
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
@@ -80,7 +79,6 @@ def _build_requests_session(total: int = 3, backoff: float = 0.6) -> requests.Se
     sess.mount("http://", adapter)
     return sess
 
-# 使い回し
 @st.cache_resource
 def get_http_session() -> requests.Session:
     return _build_requests_session(total=3, backoff=0.6)
@@ -378,21 +376,14 @@ def _format_http_error(res: requests.Response) -> str:
         return f"⚠️ Dify HTTP {res.status_code}: {txt}"
 
 def _pick_output(outputs: dict) -> str:
-    """outputs辞書から最終回答と思われるテキストだけを探す"""
     if not isinstance(outputs, dict):
         return ""
-    # 優先順位：result, output, answer, text
-    # 以前のコードでは入力を拾ってしまっていたため、キーを絞る
     candidates = ["result", "answer", "output", "text"]
     for k in candidates:
         v = outputs.get(k)
         if isinstance(v, str) and v.strip():
-            # 入力プロンプトそのものが返ってきている場合(Difyのバグ等)の対策は難しいが、
-            # 通常 output キーに入っているものが正解
             return v.strip()
     
-    # キーが見つからない場合も、極端に長い（プロンプト丸ごとのような）ものは避ける等の工夫が可能だが
-    # ここではシンプルに「一番長い文字列」を返す（Difyの出力を信じる）
     best = ""
     best_len = 0
     for v in outputs.values():
@@ -413,7 +404,6 @@ def get_workflow_run_detail(workflow_run_id: str) -> dict:
     return r.json() if r.headers.get("Content-Type","").startswith("application/json") else {"raw": r.text}
 
 def poll_workflow_until_done(workflow_run_id: str, max_wait_sec: int = 120, interval_sec: float = 1.5) -> str:
-    """streamが切れても結果を回収する保険"""
     start = time.time()
     last_status = ""
     while time.time() - start < max_wait_sec:
@@ -441,10 +431,7 @@ def poll_workflow_until_done(workflow_run_id: str, max_wait_sec: int = 120, inte
 
 def stream_dify_workflow(full_text: str):
     """
-    【修正ポイント】
-    以前は event の種類を見ずに data 内のテキストを全て拾っていたため、
-    入力プロンプト(node_finished 等に含まれる)まで表示されていた。
-    今回は 'text_chunk' (生成テキスト) と 'workflow_finished' のみに限定する。
+    text_chunk のみを yield し、入力プロンプトを拾わない
     """
     if not DIFY_API_KEY:
         yield "⚠️ DIFY_API_KEY未設定"
@@ -491,18 +478,11 @@ def stream_dify_workflow(full_text: str):
                 continue
 
             got_any_event = True
-            
-            # run_id確保
             workflow_run_id = workflow_run_id or evt.get("workflow_run_id") or (evt.get("data", {}) or {}).get("workflow_run_id") or ""
-
-            # イベントタイプを確認
+            
             event_type = evt.get("event")
             data = evt.get("data") or {}
 
-            # ---------------------------------------------------------
-            # ここが重要な修正：特定のイベントだけを処理する
-            # ---------------------------------------------------------
-            
             # 1. AI生成テキスト (Streaming)
             if event_type == "text_chunk":
                 text = data.get("text", "")
@@ -512,7 +492,6 @@ def stream_dify_workflow(full_text: str):
                 continue
 
             # 2. ワークフロー完了 (Final Output)
-            # ストリーミングされなかった場合や、最終的なまとめを受け取る
             if event_type == "workflow_finished":
                 if not got_any_text:
                     outputs = data.get("outputs", {}) or {}
@@ -521,16 +500,12 @@ def stream_dify_workflow(full_text: str):
                         yield final
                 return
 
-            # 3. その他のイベント (node_started, node_finished, workflow_started, ping など)
-            # これらには入力データ(inputs)が含まれることがあり、表示するとノイズになるので無視する
             continue
 
-        # ストリームが途切れた場合
         if not got_any_event:
             yield "⚠️ DifyがSSEを返しませんでした"
             return
 
-        # 完了していないのにストリームが終わった場合はポーリングで回収
         if workflow_run_id:
             yield poll_workflow_until_done(workflow_run_id, max_wait_sec=140)
 
@@ -579,22 +554,69 @@ def run_dify_workflow_blocking(full_text: str) -> str:
     except Exception as e:
         return f"⚠️ blocking API Error: {str(e)}"
 
+# ==================================================
+# ★重要：リトライロジック付きラッパー
+# ==================================================
 def run_dify_with_fallback(full_text: str) -> str:
-    chunks = []
-    got_error = False
-
-    for c in stream_dify_workflow(full_text):
-        chunks.append(c)
-        if isinstance(c, str) and c.startswith("⚠️ Dify HTTP"):
-            got_error = True
-            break
-
-    streamed = "".join(chunks).strip()
+    """
+    streaming → 取れなければ blocking
+    ★503エラーやOverloadedなら待機してリトライ
+    """
+    max_retries = 3
     
-    if (not streamed) or got_error:
-        return (run_dify_workflow_blocking(full_text) or "").strip() or "⚠️ Dify出力が空でした"
+    for attempt in range(max_retries):
+        chunks = []
+        got_error = False
+        error_msg = ""
+
+        # 1. Streaming
+        for c in stream_dify_workflow(full_text):
+            chunks.append(c)
+            # エラー文字列チェック
+            if isinstance(c, str) and (c.startswith("⚠️ Dify HTTP") or "503" in c or "overloaded" in c or "PluginInvokeError" in c):
+                got_error = True
+                error_msg = c
+                break
+
+        streamed = "".join(chunks).strip()
+
+        # 成功なら即終了
+        if streamed and not got_error and "⚠️" not in streamed:
+            return streamed
         
-    return streamed
+        # 2. Blocking（フォールバック）
+        blocking_res = (run_dify_workflow_blocking(full_text) or "").strip()
+        
+        # Blocking側でもエラーかチェック
+        is_server_error = False
+        if "503" in blocking_res or "overloaded" in blocking_res or "PluginInvokeError" in blocking_res:
+            is_server_error = True
+        
+        if is_server_error:
+            if attempt < max_retries - 1:
+                wait_time = 10 + (attempt * 5)
+                st.warning(f"⚠️ AIが混雑しています（503/Overloaded）。{wait_time}秒待機して再試行します... ({attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            else:
+                return f"⚠️ {max_retries}回試行しましたがAIが混雑しています: {blocking_res}"
+        
+        # エラーでなければBlockingの結果を返す
+        if blocking_res:
+            return blocking_res
+
+        # Streamingのエラーを評価してリトライするか決める
+        if error_msg:
+             if "503" in error_msg or "overloaded" in error_msg:
+                 if attempt < max_retries - 1:
+                    wait_time = 10
+                    st.warning(f"⚠️ AIが混雑しています。{wait_time}秒待機して再試行します...")
+                    time.sleep(wait_time)
+                    continue
+
+        return streamed if streamed else "⚠️ Dify出力が空でした"
+
+    return "⚠️ リトライ上限を超えました"
 
 # ==================================================
 # メイン：全レース実行（文字列を return）
@@ -710,6 +732,7 @@ def run_all_races(
                     result_blocks.append(block)
                     _ui_warning(ui, "データなしのためスキップ")
                     _ui_divider(ui)
+                    time.sleep(5) # ★負荷軽減
                     continue
 
                 prompt = (
@@ -728,22 +751,30 @@ def run_all_races(
                     answer_buf = ""
                     got_error = False
 
-                    for chunk in stream_dify_workflow(prompt):
-                        if isinstance(chunk, str) and (chunk.startswith("⚠️ Dify HTTP") or chunk.startswith("⚠️ Dify API Error")):
+                    # ★ここもリトライロジックを自前で書くか、run_dify_with_fallbackを使う
+                    # UIストリーミングとの兼ね合いが難しいので、
+                    # ここではシンプルに「エラーが出たらfallback関数に任せる」方式
+                    
+                    # まず1回Streamingトライ
+                    stream_generator = stream_dify_workflow(prompt)
+                    for chunk in stream_generator:
+                        if isinstance(chunk, str) and (chunk.startswith("⚠️ Dify HTTP") or "503" in chunk or "overloaded" in chunk):
                             got_error = True
-                            answer_buf = chunk
-                            result_area.markdown(answer_buf)
-                            break
+                            break # エラーなら即中断してfallbackへ
                         
                         answer_buf += chunk
                         result_area.markdown(answer_buf + "▌")
 
-                    if (not answer_buf) or got_error:
-                         answer_buf = run_dify_workflow_blocking(prompt) or ""
-
-                    full_ans = (answer_buf or "").strip()
-                    result_area.markdown(full_ans if full_ans else "⚠️ AIの出力が空でした")
+                    if got_error or not answer_buf:
+                        # エラーだった場合、run_dify_with_fallback（リトライ付き）に任せる
+                        # 画面には「再試行中...」と出す
+                        result_area.markdown("⚠️ AI混雑のため再試行中...")
+                        full_ans = run_dify_with_fallback(prompt)
+                        result_area.markdown(full_ans)
+                    else:
+                        full_ans = answer_buf
                 else:
+                    # UIなし
                     full_ans = run_dify_with_fallback(prompt)
 
                 full_ans = (full_ans or "").strip()
@@ -763,6 +794,9 @@ def run_all_races(
                 _ui_error(ui, f"Error: {e}")
 
             _ui_divider(ui)
+            
+            # ★負荷軽減：レースごとに少し待つ
+            time.sleep(5)
 
     finally:
         try:
@@ -878,6 +912,7 @@ def run_races_iter(
                     yield (race_num, block)
                     _ui_warning(ui, "データなしのためスキップ")
                     _ui_divider(ui)
+                    time.sleep(5) # ★負荷軽減
                     continue
 
                 prompt = (
@@ -888,6 +923,8 @@ def run_races_iter(
                 )
 
                 _ui_info(ui, "🤖 AI分析中...（Dify）")
+                
+                # ここはUIがないイテレータ版なのでリトライロジック付きを呼ぶだけでOK
                 full_ans = run_dify_with_fallback(prompt)
 
                 full_ans = (full_ans or "").strip()
@@ -907,6 +944,9 @@ def run_races_iter(
                 _ui_error(ui, f"Error: {e}")
 
             _ui_divider(ui)
+            
+            # ★負荷軽減：レースごとに少し待つ
+            time.sleep(5)
 
     finally:
         try:
