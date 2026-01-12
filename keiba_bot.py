@@ -11,8 +11,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 
 from bs4 import BeautifulSoup
-from supabase import create_client, Client
-
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -25,9 +23,6 @@ DIFY_API_KEY = st.secrets.get("DIFY_API_KEY", "")
 
 # self-host の場合はここを自分のDifyドメインに
 DIFY_BASE_URL = st.secrets.get("DIFY_BASE_URL", "https://api.dify.ai")
-
-SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
-SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
 
 # ==================================================
 # 内部ユーティリティ：UI出力のON/OFFを切り替える
@@ -83,37 +78,6 @@ def _build_requests_session(total: int = 3, backoff: float = 0.6) -> requests.Se
 def get_http_session() -> requests.Session:
     return _build_requests_session(total=3, backoff=0.6)
 
-# ==================================================
-# Supabase
-# ==================================================
-@st.cache_resource
-def get_supabase_client() -> Client | None:
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        return None
-    try:
-        return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-    except Exception as e:
-        print("Supabase client error:", e)
-        return None
-
-def save_history(year, place_code, place_name, month, day, race_num_str, race_id, ai_answer):
-    supabase = get_supabase_client()
-    if not supabase:
-        return
-    data = {
-        "year": str(year),
-        "place_code": str(place_code),
-        "place_name": place_name,
-        "month": str(month).zfill(2),
-        "day": str(day).zfill(2),
-        "race_num": str(race_num_str),
-        "race_id": str(race_id),
-        "output_text": ai_answer,
-    }
-    try:
-        supabase.table("history").insert(data).execute()
-    except Exception as e:
-        print("Supabase insert error:", e)
 
 # ==================================================
 # Selenium Driver（競馬ブック用）
@@ -268,6 +232,9 @@ def _extract_jockey_from_cell(td) -> str:
     return "不明"
 
 def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int, baba_code: str):
+    """
+    戻り値: (header, horses, url, race_level_from_nar)
+    """
     date_str = f"{year}/{str(month).zfill(2)}/{str(day).zfill(2)}"
     url = (
         "https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTableSmall"
@@ -285,6 +252,16 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
     if top_bs:
         header = top_bs.get_text(" ", strip=True)
 
+    # ----------------------------------------------------
+    # ★追加: レース名（レベル含む）を取得
+    # <span class="midium"><b><font...>芋洗坂賞Ｂ３二選抜特別</font></b></span>
+    # ----------------------------------------------------
+    nar_race_level = ""
+    title_span = soup.select_one("span.midium")
+    if title_span:
+        nar_race_level = title_span.get_text(strip=True)
+    # ----------------------------------------------------
+
     main_table = soup.select_one("td.dbtbl table.bs[border='1']")
     if not main_table:
         main_table = soup.select_one("table.bs[border='1']")
@@ -293,7 +270,7 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
     last_waku = ""
 
     if not main_table:
-        return header, horses, url
+        return header, horses, url, nar_race_level
 
     for tr in main_table.find_all("tr"):
         if not tr.select_one("font.bamei"):
@@ -358,7 +335,7 @@ def fetch_keibago_debatable_small(year: str, month: str, day: str, race_no: int,
             "is_change": is_change,
         }
 
-    return header, horses, url
+    return header, horses, url, nar_race_level
 
 # ==================================================
 # Dify：堅牢かつ余計なテキストを拾わない修正版
@@ -663,7 +640,8 @@ def run_all_races(
 
             try:
                 # 0) keiba.go.jp 出馬表
-                header, keibago_dict, keibago_url = fetch_keibago_debatable_small(
+                # ★修正: nar_race_level を受け取る
+                header, keibago_dict, keibago_url, nar_race_level = fetch_keibago_debatable_small(
                     year=str(year),
                     month=str(month),
                     day=str(day),
@@ -673,6 +651,8 @@ def run_all_races(
                 _ui_caption(ui, f"keiba.go.jp: {keibago_url}")
                 if header:
                     _ui_caption(ui, f"keiba.go.jp header: {header}")
+                if nar_race_level:
+                    _ui_caption(ui, f"Race Level(NAR): {nar_race_level}")
 
                 if not keibago_dict:
                     _ui_warning(ui, "⚠️ keiba.go.jp から出馬表が取れませんでした（続行：騎手/調教師が不明になります）")
@@ -735,9 +715,11 @@ def run_all_races(
                     time.sleep(5) # ★負荷軽減
                     continue
 
+                # ★修正: プロンプトにNARから取得したレースレベルを追加
                 prompt = (
                     f"{place_name}競馬場のレースのデータです。\n\n"
                     f"レース名: {race_meta.get('race_name','')}\n"
+                    f"レースレベル: {nar_race_level}\n"
                     f"条件: {race_meta.get('cond','')}\n\n"
                     "以下の各馬のデータ（馬名、騎手、乗り替わり、調教師、談話、調教）です。\n"
                     + "\n".join(merged_text)
@@ -751,10 +733,6 @@ def run_all_races(
                     answer_buf = ""
                     got_error = False
 
-                    # ★ここもリトライロジックを自前で書くか、run_dify_with_fallbackを使う
-                    # UIストリーミングとの兼ね合いが難しいので、
-                    # ここではシンプルに「エラーが出たらfallback関数に任せる」方式
-                    
                     # まず1回Streamingトライ
                     stream_generator = stream_dify_workflow(prompt)
                     for chunk in stream_generator:
@@ -767,7 +745,6 @@ def run_all_races(
 
                     if got_error or not answer_buf:
                         # エラーだった場合、run_dify_with_fallback（リトライ付き）に任せる
-                        # 画面には「再試行中...」と出す
                         result_area.markdown("⚠️ AI混雑のため再試行中...")
                         full_ans = run_dify_with_fallback(prompt)
                         result_area.markdown(full_ans)
@@ -783,7 +760,8 @@ def run_all_races(
 
                 _ui_success(ui, "✅ 完了")
 
-                save_history(year, place_code, place_name, month, day, race_num_str, race_id, full_ans)
+                # ここで履歴保存などを行いたい場合は適宜コメントアウト解除など
+                # save_history(year, place_code, place_name, month, day, race_num_str, race_id, full_ans)
 
                 block = f"【{place_name} {race_num}R】\n{full_ans}"
                 result_blocks.append(block)
@@ -846,7 +824,8 @@ def run_races_iter(
             _ui_caption(ui, f"race_id(keibabook): {race_id}")
 
             try:
-                header, keibago_dict, keibago_url = fetch_keibago_debatable_small(
+                # ★修正: nar_race_level を受け取る
+                header, keibago_dict, keibago_url, nar_race_level = fetch_keibago_debatable_small(
                     year=str(year),
                     month=str(month),
                     day=str(day),
@@ -856,6 +835,8 @@ def run_races_iter(
                 _ui_caption(ui, f"keiba.go.jp: {keibago_url}")
                 if header:
                     _ui_caption(ui, f"keiba.go.jp header: {header}")
+                if nar_race_level:
+                    _ui_caption(ui, f"Race Level(NAR): {nar_race_level}")
 
                 if not keibago_dict:
                     _ui_warning(ui, "⚠️ keiba.go.jp から出馬表が取れませんでした")
@@ -915,8 +896,10 @@ def run_races_iter(
                     time.sleep(5) # ★負荷軽減
                     continue
 
+                # ★修正: プロンプトにNARから取得したレースレベルを追加
                 prompt = (
                     f"レース名: {race_meta.get('race_name','')}\n"
+                    f"レースレベル: {nar_race_level}\n"
                     f"条件: {race_meta.get('cond','')}\n\n"
                     "以下の各馬のデータ（馬名、騎手、乗り替わり、調教師、談話、調教）です。\n"
                     + "\n".join(merged_text)
@@ -933,7 +916,7 @@ def run_races_iter(
 
                 _ui_success(ui, "✅ 完了")
 
-                save_history(year, place_code, place_name, month, day, race_num_str, race_id, full_ans)
+                # save_history(year, place_code, place_name, month, day, race_num_str, race_id, full_ans)
 
                 block = f"【{place_name} {race_num}R】\n{full_ans}"
                 yield (race_num, block)
