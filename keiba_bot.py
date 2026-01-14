@@ -305,12 +305,10 @@ def _get_kai_nichi_from_web(target_month, target_day, target_place_name):
 def _parse_grades(text):
     """
     Difyの出力テキストから {馬名: 評価} の辞書を作成する。
-    テーブル形式 (| 馬名 | ... | A |) だけでなく、リスト形式なども柔軟に解析。
     """
     grades = {}
     if not text: return grades
     
-    # 1. テーブル形式 (| ... |) の解析
     # 行ごとに処理
     for line in text.split('\n'):
         line = line.strip()
@@ -338,17 +336,12 @@ def _parse_grades(text):
                     if clean_name:
                         grades[clean_name] = found_grade
                         continue # 次の行へ
-
-    # 2. もしテーブルで取れなかった場合や、補完のために別パターンも探索
-    # 例: "1. 馬名: A" や "①馬名 (A)" など
-    # (今回はテーブル形式が主なので、上記で十分な場合が多いが念のため)
     
     return grades
 
 def _parse_grades_fuzzy(horse_name, grades):
     """
     対戦表の馬名(horse_name)が、Dify評価リスト(grades)にあるか探す。
-    完全一致しなくても、包含関係でヒットさせる。
     """
     # 1. 完全一致
     if horse_name in grades:
@@ -363,8 +356,6 @@ def _parse_grades_fuzzy(horse_name, grades):
             
     # 3. 部分一致 (どちらかがどちらかを含んでいる)
     for k, v in grades.items():
-        # Dify側の馬名(k)が、対戦表の馬名(horse_name)に含まれている
-        # またはその逆
         if k in horse_name or horse_name in k:
             return v
             
@@ -492,14 +483,13 @@ def _format_http_error(res: requests.Response) -> str:
 def run_dify_with_blocking_robust(full_text: str) -> str:
     """
     DifyへBlockingモードでリクエスト。
-    タイムアウト600秒で待機。
     """
     if not DIFY_API_KEY: return "⚠️ DIFY_API_KEY未設定"
     
     url = _dify_url("/v1/workflows/run")
     payload = {
         "inputs": {"text": full_text},
-        "response_mode": "blocking", # ★Streaming廃止
+        "response_mode": "blocking",
         "user": "keiba-bot",
     }
     headers = {"Authorization": f"Bearer {DIFY_API_KEY}", "Content-Type": "application/json"}
@@ -513,7 +503,6 @@ def run_dify_with_blocking_robust(full_text: str) -> str:
             res = sess.post(url, headers=headers, json=payload, timeout=(10, 600))
             
             if res.status_code != 200:
-                # 503/504系ならリトライ
                 if res.status_code in [500, 502, 503, 504]:
                     if attempt < max_retries - 1:
                         time.sleep(10)
@@ -522,7 +511,18 @@ def run_dify_with_blocking_robust(full_text: str) -> str:
             
             j = res.json() or {}
             outputs = j.get("data", {}).get("outputs", {})
-            return outputs.get("text") or str(outputs)
+
+            # 【修正1】出力が "answer" キーに入っている場合は優先してそれを返す
+            # さらに "answer" の中身が単なるテキストであることを期待
+            if "answer" in outputs:
+                return outputs["answer"]
+            
+            # 通常のテキストキー
+            if "text" in outputs:
+                return outputs["text"]
+
+            # どちらもなければ文字列化 (フォールバック)
+            return str(outputs)
 
         except requests.exceptions.Timeout:
             if attempt < max_retries - 1:
@@ -640,3 +640,38 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
     finally:
         try: driver.quit()
         except: pass
+
+# ==================================================
+# Streamlitメイン処理
+# ==================================================
+# ※以下のロジックをメインファイル(app.py等)に記述してください。
+#   既存のst.container()などの描画部分で、ループ終了後に全結合テキストを表示します。
+#
+# 【修正2】呼び出し側コードの例
+"""
+# (前略... existing code)
+
+# 結果表示用コンテナ
+result_container = st.container()
+
+if start_btn:
+    # (中略... 初期化など)
+
+    for race_num, output_text in run_races_iter(...):
+        # 既存の1レースごとの表示処理
+        st.session_state.results_cache[race_num] = output_text
+        with result_container:
+             st.subheader(f"{selected_place} {race_num}R")
+             st.text_area(..., value=output_text, ...)
+
+    st.success("✅ 全ての処理が完了しました！")
+
+    # ★ここに追加: 全レースの結果を結合して表示
+    if st.session_state.results_cache:
+        all_results_text = ""
+        for r, txt in sorted(st.session_state.results_cache.items()):
+            all_results_text += f"\n\n{'='*30}\n【{selected_place} {r}R】\n{'='*30}\n{txt}\n"
+        
+        st.markdown("### 📋 全レース予想まとめ (コピー用)")
+        st.text_area("全レース結果を一括コピー", value=all_results_text, height=600)
+"""
