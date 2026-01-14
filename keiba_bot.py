@@ -512,16 +512,13 @@ def run_dify_with_blocking_robust(full_text: str) -> str:
             j = res.json() or {}
             outputs = j.get("data", {}).get("outputs", {})
 
-            # 【修正1】出力が "answer" キーに入っている場合は優先してそれを返す
-            # さらに "answer" の中身が単なるテキストであることを期待
+            # ★ここを修正: Difyの出力が{'answer': ...} 形式の場合に対応
             if "answer" in outputs:
                 return outputs["answer"]
             
-            # 通常のテキストキー
             if "text" in outputs:
                 return outputs["text"]
 
-            # どちらもなければ文字列化 (フォールバック)
             return str(outputs)
 
         except requests.exceptions.Timeout:
@@ -640,38 +637,3 @@ def run_races_iter(year, month, day, place_code, target_races, ui=False):
     finally:
         try: driver.quit()
         except: pass
-
-# ==================================================
-# Streamlitメイン処理
-# ==================================================
-# ※以下のロジックをメインファイル(app.py等)に記述してください。
-#   既存のst.container()などの描画部分で、ループ終了後に全結合テキストを表示します。
-#
-# 【修正2】呼び出し側コードの例
-"""
-# (前略... existing code)
-
-# 結果表示用コンテナ
-result_container = st.container()
-
-if start_btn:
-    # (中略... 初期化など)
-
-    for race_num, output_text in run_races_iter(...):
-        # 既存の1レースごとの表示処理
-        st.session_state.results_cache[race_num] = output_text
-        with result_container:
-             st.subheader(f"{selected_place} {race_num}R")
-             st.text_area(..., value=output_text, ...)
-
-    st.success("✅ 全ての処理が完了しました！")
-
-    # ★ここに追加: 全レースの結果を結合して表示
-    if st.session_state.results_cache:
-        all_results_text = ""
-        for r, txt in sorted(st.session_state.results_cache.items()):
-            all_results_text += f"\n\n{'='*30}\n【{selected_place} {r}R】\n{'='*30}\n{txt}\n"
-        
-        st.markdown("### 📋 全レース予想まとめ (コピー用)")
-        st.text_area("全レース結果を一括コピー", value=all_results_text, height=600)
-"""
