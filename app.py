@@ -13,7 +13,7 @@ JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 with st.sidebar:
     st.header("開催設定")
     
-    # 修正②: 日本時間の今日の日付を取得
+    # 日本時間の今日の日付を取得
     today = datetime.datetime.now(JST).date()
     target_date = st.date_input("開催日", today)
     
@@ -24,8 +24,7 @@ with st.sidebar:
     st.divider()
     st.subheader("対象レース選択")
     
-    # 修正①: チェックボックスの状態管理用ロジック
-    # セッションステートに各レースのチェック状態を初期化 (初回のみ)
+    # チェックボックスの状態管理用ロジック
     if "chk_1" not in st.session_state:
         default_races = [10, 11, 12] # デフォルトでチェックしたいレース
         for r in range(1, 13):
@@ -55,8 +54,6 @@ with st.sidebar:
             if is_checked:
                 selected_races_final.append(r)
     
-    # ※選択リストの保存は不要になったため、selected_races_finalをそのまま使用します
-
     st.caption("※Dify生成待機: 最大10分/レース")
     
     # ボタンにユニークキーを設定してリセット防止
@@ -70,14 +67,14 @@ with st.sidebar:
 # --- メイン処理 ---
 result_container = st.container()
 
-# 1. 既に計算済みの結果があれば表示
+# 1. 既に計算済みの結果があれば、個別の結果を表示
 if st.session_state.results_cache:
     with result_container:
         st.success("📝 前回の生成結果を表示しています")
         for r_num, text in sorted(st.session_state.results_cache.items()):
             st.subheader(f"{selected_place} {r_num}R")
             st.text_area(
-                label=f"{r_num}R 結果 (Ctrl+A -> Ctrl+C)",
+                label=f"{r_num}R 結果",
                 value=text,
                 height=500,
                 key=f"res_cache_{r_num}"
@@ -111,7 +108,7 @@ if start_btn:
             with result_container:
                 st.subheader(f"{selected_place} {race_num}R")
                 st.text_area(
-                    label=f"{race_num}R 結果 (Ctrl+A -> Ctrl+C)",
+                    label=f"{race_num}R 結果",
                     value=output_text,
                     height=500,
                     key=f"res_new_{race_num}"
@@ -119,3 +116,18 @@ if start_btn:
                 st.divider()
 
     st.success("✅ 全ての処理が完了しました！")
+
+# 3. ★全レースの結果まとめ表示（コピー機能付き）
+# キャッシュが存在する場合、常に最下部に「まとめ」を表示します
+if st.session_state.results_cache:
+    st.markdown("### 📋 全レース予想まとめ (一括コピー用)")
+    st.caption("以下のボックスの右上にあるコピーアイコンをクリックすると、すべての結果を一括でコピーできます。")
+    
+    # 全レースのテキストを結合
+    all_results_text = ""
+    for r_num in sorted(st.session_state.results_cache.keys()):
+        text = st.session_state.results_cache[r_num]
+        all_results_text += f"{'='*30}\n【{selected_place} {r_num}R】\n{'='*30}\n{text}\n\n"
+    
+    # st.code を使うと、右上にコピーボタンが自動で付きます
+    st.code(all_results_text, language="markdown")
