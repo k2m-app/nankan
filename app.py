@@ -1,165 +1,111 @@
 import streamlit as st
+import datetime
 import keiba_bot
-from datetime import datetime, timedelta, timezone
-import re
 
-# ==================================================
-# ページ設定
-# ==================================================
-st.set_page_config(
-    page_title="NANKAN AI",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="南関競馬AI予想くん", layout="wide")
 
-st.markdown(
-    """
-    <style>
-      .block-container { padding-top: 1rem; padding-bottom: 2rem; }
-      .stButton>button { width: 100%; padding: 0.8rem 1rem; font-size: 1.05rem; }
-      .stTextArea textarea { font-size: 0.98rem; line-height: 1.45; }
-      .small-muted { color: #666; font-size: 0.9rem; }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+st.title("🐎 南関競馬 AI予想生成 & 対戦表")
 
-st.title("NANKAN AI")
-
-# ==================================================
-# サイドバー：開催設定
-# ==================================================
-st.sidebar.header("開催設定")
-
-JST = timezone(timedelta(hours=9))
-now = datetime.now(JST)
-
-year = st.sidebar.text_input("年 (YEAR)", value=str(now.year))
-
-month_options = [f"{i:02}" for i in range(1, 13)]
-month = st.sidebar.selectbox("月 (MONTH)", month_options, index=now.month - 1)
-
-day_options = [f"{i:02}" for i in range(1, 32)]
-day = st.sidebar.selectbox("日 (DAY)", day_options, index=now.day - 1)
-
-places = {"10": "大井", "11": "川崎", "12": "船橋", "13": "浦和"}
-place_name = st.sidebar.selectbox("競馬場 (PLACE)", list(places.values()), index=1)
-place_code = [k for k, v in places.items() if v == place_name][0]
-
-st.sidebar.divider()
-st.sidebar.header("分析するレース")
-
-# ==================================================
-# レース選択（全レース選択ボタン付き）
-# ==================================================
-race_labels = [f"{i}R" for i in range(1, 13)]
-
-if "selected_races" not in st.session_state:
-    st.session_state["selected_races"] = ["1R"]
-
-c1, c2 = st.sidebar.columns(2)
-with c1:
-    if st.button("✅ 全レース選択"):
-        st.session_state["selected_races"] = race_labels.copy()
-with c2:
-    if st.button("❌ クリア"):
-        st.session_state["selected_races"] = []
-
-selected_race_labels = st.sidebar.multiselect(
-    "レースを選択（複数可）",
-    race_labels,
-    key="selected_races"
-)
-
-target_races = {int(r.replace("R", "")) for r in selected_race_labels}
-
-st.sidebar.caption("※ 設定後、下の「分析スタート」で実行します。")
-
-# ==================================================
-# メイン
-# ==================================================
-st.write(f"### 設定: {year}年 {month}月{day}日 {place_name}")
-st.markdown('<div class="small-muted">分析完了後、下部にコピー用エリアが表示されます</div>', unsafe_allow_html=True)
-st.write("")
-
-run = st.button("分析スタート 🚀")
-
-def _normalize_text(s: str) -> str:
-    if not isinstance(s, str):
-        s = str(s)
-    s = s.replace("\r\n", "\n")
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
-
-# ==================================================
-# 実行：逐次表示（終わったレースから順に出す）
-# ==================================================
-if run:
-    if not target_races:
-        st.warning("レースを選んでください")
-    else:
-        live = st.container()        # レースごとの表示をここに積む
-        result_blocks = []           # 最後にまとめコピー用
-
-        with st.spinner("分析中...（終わったレースから順に表示します）"):
-            try:
-                # 逐次取得：race_num, block_text
-                for race_num, block in keiba_bot.run_races_iter(
-                    year=str(year),
-                    month=str(month),
-                    day=str(day),
-                    place_code=str(place_code),
-                    target_races=target_races,
-                    ui=False
-                ):
-                    block = _normalize_text(block)
-                    result_blocks.append(block)
-
-                    # レースごとに表示
-                    with live:
-                        with st.expander(f"{place_name} {race_num}R", expanded=False):
-                            st.text_area(
-                                f"{place_name} {race_num}R",
-                                block,
-                                height=280
-                            )
-
-                # まとめ保存（コピー用）
-                result_text = _normalize_text("\n\n".join(result_blocks))
-                st.session_state["result_text"] = result_text
-                st.session_state["last_meta"] = {
-                    "year": year, "month": month, "day": day,
-                    "place_name": place_name,
-                    "races": sorted(list(target_races))
-                }
-
-                st.success(f"{place_name}：{', '.join(f'{r}R' for r in sorted(target_races))} の分析が完了しました！")
-
-            except Exception as e:
-                st.error(f"エラーが発生しました: {e}")
-
-# ==================================================
-# 結果表示（実行後も残る：まとめコピー）
-# ==================================================
-if "result_text" in st.session_state and st.session_state["result_text"]:
-    meta = st.session_state.get("last_meta", {})
-    title = f"📋 分析結果（{meta.get('place_name','')} {meta.get('year','')}年{meta.get('month','')}月{meta.get('day','')}日）"
+# --- サイドバー設定 ---
+with st.sidebar:
+    st.header("開催設定")
     
-    st.markdown("---")
-    st.subheader(title)
-
-    # --------------------------------------------------
-    # 【変更点】st.code を使用して確実なコピーを実現
-    # --------------------------------------------------
-    st.info("右上のコピーボタンを押すと全文コピーできます 👇")
+    today = datetime.date.today()
+    target_date = st.date_input("開催日", today)
     
-    # language="text" にすることでシンタックスハイライトなしの純粋なテキストとして表示
-    st.code(st.session_state["result_text"], language="text")
+    place_options = {"大井": "10", "川崎": "11", "船橋": "12", "浦和": "13"}
+    selected_place = st.selectbox("競馬場", list(place_options.keys()))
+    place_code = place_options[selected_place]
+    
+    st.divider()
+    st.subheader("対象レース選択")
+    
+    # セッションステート初期化
+    if "selected_races" not in st.session_state:
+        st.session_state.selected_races = [10, 11, 12]
+    
+    # 結果保存用のステート初期化
+    if "results_cache" not in st.session_state:
+        st.session_state.results_cache = {}
 
-    # 手動編集したいとき用にテキストエリアも残しておく（不要なら削除可）
-    with st.expander("手動で編集してからコピーしたい場合はこちら"):
-        st.text_area(
-            "編集用エリア",
-            st.session_state["result_text"],
-            height=360
-        )
+    # 全選択/解除ボタン
+    col_a, col_c = st.columns(2)
+    if col_a.button("全選択"):
+        st.session_state.selected_races = list(range(1, 13))
+    if col_c.button("全解除"):
+        st.session_state.selected_races = []
+
+    # チェックボックスグリッド
+    selected_races_final = []
+    cols = st.columns(3)
+    for r in range(1, 13):
+        with cols[(r-1)%3]:
+            # keyをユニークにして状態管理
+            checked = st.checkbox(f"{r}R", value=(r in st.session_state.selected_races), key=f"chk_{r}")
+            if checked:
+                selected_races_final.append(r)
+    
+    st.session_state.selected_races = selected_races_final
+
+    st.caption("※Dify生成待機: 最大10分/レース")
+    
+    # ボタンにユニークキーを設定してリセット防止
+    start_btn = st.button("予想開始", type="primary", key="btn_start")
+    
+    # キャッシュクリアボタン
+    if st.button("結果クリア"):
+        st.session_state.results_cache = {}
+        st.rerun()
+
+# --- メイン処理 ---
+result_container = st.container()
+
+# 1. 既に計算済みの結果があれば表示
+if st.session_state.results_cache:
+    with result_container:
+        st.success("📝 前回の生成結果を表示しています")
+        for r_num, text in sorted(st.session_state.results_cache.items()):
+            st.subheader(f"{selected_place} {r_num}R")
+            st.text_area(
+                label=f"{r_num}R 結果 (Ctrl+A -> Ctrl+C)",
+                value=text,
+                height=500,
+                key=f"res_cache_{r_num}"
+            )
+            st.divider()
+
+# 2. ボタンが押されたら新規実行
+if start_btn:
+    if not selected_races_final:
+        st.warning("レースを選択してください。")
+        st.stop()
+
+    # キャッシュをクリアして再実行
+    st.session_state.results_cache = {}
+    
+    year = target_date.year
+    month = f"{target_date.month:02}"
+    day = f"{target_date.day:02}"
+    
+    st.info(f"🚀 {year}/{month}/{day} {selected_place}競馬 ({len(selected_races_final)}レース) の予想を開始します...")
+
+    # ジェネレータ実行
+    for race_num, output_text in keiba_bot.run_races_iter(year, month, day, place_code, set(selected_races_final), ui=True):
+        
+        if race_num == 0:
+            st.error(output_text)
+        else:
+            # 結果をキャッシュに保存
+            st.session_state.results_cache[race_num] = output_text
+            
+            with result_container:
+                st.subheader(f"{selected_place} {race_num}R")
+                st.text_area(
+                    label=f"{race_num}R 結果 (Ctrl+A -> Ctrl+C)",
+                    value=output_text,
+                    height=500,
+                    key=f"res_new_{race_num}"
+                )
+                st.divider()
+
+    st.success("✅ 全ての処理が完了しました！")
