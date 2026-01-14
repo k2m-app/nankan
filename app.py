@@ -6,11 +6,15 @@ st.set_page_config(page_title="南関競馬AI予想くん", layout="wide")
 
 st.title("🐎 南関競馬 AI予想生成 & 対戦表")
 
+# --- 日本時間 (JST) の定義 ---
+JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
+
 # --- サイドバー設定 ---
 with st.sidebar:
     st.header("開催設定")
     
-    today = datetime.date.today()
+    # 修正②: 日本時間の今日の日付を取得
+    today = datetime.datetime.now(JST).date()
     target_date = st.date_input("開催日", today)
     
     place_options = {"大井": "10", "川崎": "11", "船橋": "12", "浦和": "13"}
@@ -20,32 +24,38 @@ with st.sidebar:
     st.divider()
     st.subheader("対象レース選択")
     
-    # セッションステート初期化
-    if "selected_races" not in st.session_state:
-        st.session_state.selected_races = [10, 11, 12]
-    
+    # 修正①: チェックボックスの状態管理用ロジック
+    # セッションステートに各レースのチェック状態を初期化 (初回のみ)
+    if "chk_1" not in st.session_state:
+        default_races = [10, 11, 12] # デフォルトでチェックしたいレース
+        for r in range(1, 13):
+            st.session_state[f"chk_{r}"] = (r in default_races)
+
+    # コールバック関数: 全選択・全解除用
+    def update_all_races(is_selected):
+        for r in range(1, 13):
+            st.session_state[f"chk_{r}"] = is_selected
+
     # 結果保存用のステート初期化
     if "results_cache" not in st.session_state:
         st.session_state.results_cache = {}
 
-    # 全選択/解除ボタン
+    # 全選択/解除ボタン (on_clickコールバックを使用)
     col_a, col_c = st.columns(2)
-    if col_a.button("全選択"):
-        st.session_state.selected_races = list(range(1, 13))
-    if col_c.button("全解除"):
-        st.session_state.selected_races = []
+    col_a.button("全選択", on_click=update_all_races, args=(True,))
+    col_c.button("全解除", on_click=update_all_races, args=(False,))
 
     # チェックボックスグリッド
     selected_races_final = []
     cols = st.columns(3)
     for r in range(1, 13):
         with cols[(r-1)%3]:
-            # keyをユニークにして状態管理
-            checked = st.checkbox(f"{r}R", value=(r in st.session_state.selected_races), key=f"chk_{r}")
-            if checked:
+            # keyを指定することでsession_stateと直接連動させる
+            is_checked = st.checkbox(f"{r}R", key=f"chk_{r}")
+            if is_checked:
                 selected_races_final.append(r)
     
-    st.session_state.selected_races = selected_races_final
+    # ※選択リストの保存は不要になったため、selected_races_finalをそのまま使用します
 
     st.caption("※Dify生成待機: 最大10分/レース")
     
